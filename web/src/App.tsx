@@ -8,10 +8,10 @@ export default function App() {
     <div className="min-h-screen bg-sentience-bg">
       <header className="border-b border-sentience-border px-6 py-4 flex items-end gap-3">
         <h1 className="text-2xl font-bold text-sentience-cyan tracking-[0.25em]">
-          SENTIENCE
+          QUESTROOMSCAN
         </h1>
         <span className="text-sm text-sentience-cyan-dim tracking-[0.2em] mb-0.5">
-          GS TRAINING SERVER
+          GAUSSIAN SPLAT TRAINING
         </span>
         <div className="ml-auto">
           <StateBadge state={status.state} />

@@ -5,7 +5,6 @@ import KeyframeBrowser from './KeyframeBrowser';
 import PointCloudViewer from './PointCloudViewer';
 import SplatViewer from './SplatViewer';
 import LogPanel from './LogPanel';
-import RenderGallery from './RenderGallery';
 
 interface Props {
   status: TrainingStatus;
@@ -23,12 +22,9 @@ export default function Dashboard({ status }: Props) {
         <LogPanel />
       </div>
 
-      {/* Row 2: Keyframes | Renders */}
-      <div className="lg:col-span-2">
+      {/* Row 2: Keyframes */}
+      <div className="lg:col-span-3">
         <KeyframeBrowser status={status} />
-      </div>
-      <div className="lg:col-span-1">
-        <RenderGallery status={status} />
       </div>
 
       {/* Row 3: Point Cloud | Splat */}

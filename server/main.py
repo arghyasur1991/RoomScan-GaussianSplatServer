@@ -28,7 +28,7 @@ DEFAULT_ITERATIONS = 7000
 
 manager = TrainingManager(WORK_DIR, DEFAULT_ITERATIONS)
 
-app = FastAPI(title="Sentience GS Training Server", version="1.0.0")
+app = FastAPI(title="QuestRoomScan GS Training Server", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,

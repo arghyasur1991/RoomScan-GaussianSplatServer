@@ -25,11 +25,6 @@ export interface KeyframesResponse {
   count: number;
 }
 
-export interface RendersResponse {
-  renders: string[];
-  count: number;
-}
-
 export async function fetchStatus(): Promise<TrainingStatus> {
   const res = await fetch('/api/status');
   return res.json();
@@ -37,11 +32,6 @@ export async function fetchStatus(): Promise<TrainingStatus> {
 
 export async function fetchKeyframes(): Promise<KeyframesResponse> {
   const res = await fetch('/api/keyframes');
-  return res.json();
-}
-
-export async function fetchRenders(): Promise<RendersResponse> {
-  const res = await fetch('/api/renders');
   return res.json();
 }
 
