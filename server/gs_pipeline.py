@@ -215,6 +215,26 @@ def convert_to_colmap(capture_dir: Path, frames: list):
             f.write(struct.pack("<Q", 0))
         print("points3D.bin: empty (no PLY found)")
 
+    # Compute and save scene normalization params (center + scale of camera
+    # positions in COLMAP space). msplat normalizes internally using these but
+    # doesn't expose them, so we recompute to denormalize the output PLY.
+    cam_positions = []
+    for frame in frames:
+        cam_positions.append([frame["px"], -frame["py"], frame["pz"]])
+    cam_positions = np.array(cam_positions)
+    scene_center = cam_positions.mean(axis=0)
+    dists = np.linalg.norm(cam_positions - scene_center, axis=1)
+    scene_avg_dist = float(dists.mean())
+
+    norm_params = {
+        "center": scene_center.tolist(),
+        "avg_dist": scene_avg_dist,
+    }
+    norm_path = capture_dir / "scene_norm.json"
+    with open(norm_path, "w") as f:
+        json.dump(norm_params, f)
+    print(f"Scene normalization: center={scene_center}, avg_dist={scene_avg_dist:.4f}")
+
     print(f"COLMAP binary files written to {sparse_dir}")
     return sparse_dir
 
@@ -327,17 +347,98 @@ def _run_with_logging(cmd: list, log_fn=None):
     return proc.returncode
 
 
+def denormalize_ply(ply_path: Path, norm_path: Path, log_fn=None):
+    """Undo msplat's internal scene normalization on the trained PLY.
+
+    msplat normalizes positions as: P_norm = (P_colmap - center) / avg_dist
+    This reverses it: P_colmap = P_norm * avg_dist + center
+    Gaussian scales (log-space) are adjusted: s_world = s_norm + ln(avg_dist)
+    """
+    import math
+
+    log_fn = log_fn or print
+    if not norm_path.exists():
+        log_fn("No scene_norm.json found, skipping denormalization")
+        return
+    if not ply_path.exists():
+        return
+
+    with open(norm_path) as f:
+        params = json.load(f)
+    center = params["center"]
+    avg_dist = params["avg_dist"]
+    log_scale_offset = math.log(avg_dist)
+
+    log_fn(f"Denormalizing PLY: center={center}, avg_dist={avg_dist:.4f}")
+
+    with open(ply_path, "rb") as f:
+        header_lines = []
+        vertex_count = 0
+        props = []
+        while True:
+            line = f.readline()
+            header_lines.append(line)
+            text = line.decode("ascii").strip()
+            if text.startswith("element vertex"):
+                vertex_count = int(text.split()[-1])
+            elif text.startswith("property float") or text.startswith("property double"):
+                props.append(text.split()[2])
+            elif text == "end_header":
+                break
+
+        header_bytes = b"".join(header_lines)
+        body = f.read()
+
+    idx_x = props.index("x")
+    idx_y = props.index("y")
+    idx_z = props.index("z")
+    idx_s0 = props.index("scale_0") if "scale_0" in props else -1
+    idx_s1 = props.index("scale_1") if "scale_1" in props else -1
+    idx_s2 = props.index("scale_2") if "scale_2" in props else -1
+
+    stride = len(props) * 4
+    if len(body) < vertex_count * stride:
+        log_fn(f"WARNING: PLY body too small ({len(body)} < {vertex_count * stride})")
+        return
+
+    import array
+    data = array.array("f", body[:vertex_count * stride])
+
+    for i in range(vertex_count):
+        base = i * len(props)
+        data[base + idx_x] = data[base + idx_x] * avg_dist + center[0]
+        data[base + idx_y] = data[base + idx_y] * avg_dist + center[1]
+        data[base + idx_z] = data[base + idx_z] * avg_dist + center[2]
+        if idx_s0 >= 0:
+            data[base + idx_s0] += log_scale_offset
+        if idx_s1 >= 0:
+            data[base + idx_s1] += log_scale_offset
+        if idx_s2 >= 0:
+            data[base + idx_s2] += log_scale_offset
+
+    with open(ply_path, "wb") as f:
+        f.write(header_bytes)
+        f.write(data.tobytes())
+        if len(body) > vertex_count * stride:
+            f.write(body[vertex_count * stride:])
+
+    log_fn(f"Denormalized {vertex_count} gaussians in {ply_path.name}")
+
+
 def train(capture_dir: Path, args, log_fn=None):
     """Auto-detect and run the best available GS training backend."""
     log_fn = log_fn or print
     output_dir = capture_dir / "output"
     output_dir.mkdir(exist_ok=True)
 
+    norm_path = capture_dir / "scene_norm.json"
+
     # msplat (Metal, Apple Silicon)
     try:
         import msplat  # noqa: F401
         log_fn("Using msplat (Metal) for training...")
         train_msplat(capture_dir, output_dir, args, log_fn)
+        denormalize_ply(output_dir / "splat.ply", norm_path, log_fn)
         return output_dir
     except ImportError:
         pass
@@ -347,6 +448,7 @@ def train(capture_dir: Path, args, log_fn=None):
         import gsplat  # noqa: F401
         log_fn("Using gsplat for training...")
         train_gsplat(capture_dir, output_dir, args, log_fn)
+        denormalize_ply(output_dir / "splat.ply", norm_path, log_fn)
         return output_dir
     except ImportError:
         pass
@@ -356,6 +458,7 @@ def train(capture_dir: Path, args, log_fn=None):
     if gs_repo and gs_repo.exists():
         log_fn(f"Using 3DGS repo at {gs_repo}...")
         train_3dgs(capture_dir, output_dir, gs_repo, args, log_fn)
+        denormalize_ply(output_dir / "splat.ply", norm_path, log_fn)
         return output_dir
 
     log_fn("ERROR: No Gaussian Splatting training backend found.")
