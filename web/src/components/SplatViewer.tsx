@@ -68,7 +68,7 @@ export default function SplatViewer({ status }: Props) {
         });
         viewerRef.current = viewer;
 
-        await viewer.addSplatScene(splatUrl, { showLoadingUI: false, format: 2 /* SceneFormat.Ply */ });
+        await viewer.addSplatScene(splatUrl, { showLoadingUI: true, format: 2 /* SceneFormat.Ply */ });
 
         if (cancelled) return;
 
@@ -124,16 +124,11 @@ export default function SplatViewer({ status }: Props) {
         {/* Three.js canvas lives here -- React never touches children of this div */}
         <div ref={canvasRef} className="absolute inset-0" />
 
-        {showOverlay && (
+        {!loaded && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            {!isDone && !loading && (
+            {!isDone && !loading && !error && (
               <span className="text-sentience-muted text-sm">
                 Splat viewer will appear after training completes.
-              </span>
-            )}
-            {loading && (
-              <span className="text-sentience-cyan text-sm animate-pulse">
-                Loading Gaussian Splat...
               </span>
             )}
             {error && (
