@@ -168,7 +168,7 @@ async def api_render_image(filename: str):
     return FileResponse(path=path, media_type=media)
 
 
-@app.get("/api/splat")
+@app.api_route("/api/splat", methods=["GET", "HEAD"])
 async def api_splat():
     s = manager.get_status()
     if s["state"] != TrainingState.DONE or manager.output_ply is None:
