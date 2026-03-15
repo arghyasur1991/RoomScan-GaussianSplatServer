@@ -69,6 +69,7 @@ export default function SplatViewer({ status }: Props) {
         selfDrivenMode: true,
         useBuiltInControls: true,
         dynamicScene: false,
+        sharedMemoryForWorkers: false,
         rootElement: container,
       });
       viewerRef.current = viewer;
