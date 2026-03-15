@@ -261,43 +261,68 @@ def write_colmap_points3d_bin(path: Path, points: list):
 def _run_with_logging(cmd: list, log_fn=None):
     """Run a subprocess, streaming stdout/stderr line-by-line to log_fn.
 
-    Handles both \\n and \\r as line terminators (msplat uses \\r for
-    in-place progress updates).
+    Uses a pseudo-TTY so that libraries like tqdm produce progress output
+    (they suppress it when stdout is a pipe). Handles \\n and \\r as line
+    terminators.
     """
+    import pty
+    import select
+
     log_fn = log_fn or print
     log_fn(f"Running: {' '.join(cmd)}")
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
+    # Open a PTY so the child thinks it has a real terminal
+    master_fd, slave_fd = pty.openpty()
+
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        stdin=subprocess.DEVNULL,
         env=env,
     )
+    os.close(slave_fd)  # parent doesn't need the slave end
 
     buf = b""
     while True:
-        chunk = proc.stdout.read(1)
-        if not chunk:
+        # Wait for data or process exit
+        ready, _, _ = select.select([master_fd], [], [], 1.0)
+        if ready:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            for byte in chunk:
+                ch = bytes([byte])
+                if ch in (b"\n", b"\r"):
+                    if buf:
+                        line = buf.decode("utf-8", errors="replace")
+                        # Strip ANSI escape codes for clean logging
+                        import re
+                        clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", line).rstrip()
+                        if clean:
+                            log_fn(clean)
+                            print(clean, flush=True)
+                        buf = b""
+                else:
+                    buf += ch
+        elif proc.poll() is not None:
             break
-        if chunk in (b"\n", b"\r"):
-            if buf:
-                line = buf.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    log_fn(line)
-                    print(line, flush=True)
-                buf = b""
-        else:
-            buf += chunk
 
     if buf:
-        line = buf.decode("utf-8", errors="replace").rstrip()
-        if line:
-            log_fn(line)
-            print(line, flush=True)
+        import re
+        line = buf.decode("utf-8", errors="replace")
+        clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", line).rstrip()
+        if clean:
+            log_fn(clean)
+            print(clean, flush=True)
 
+    os.close(master_fd)
     proc.wait()
     return proc.returncode
 
