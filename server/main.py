@@ -233,10 +233,15 @@ async def ws_status(websocket: WebSocket):
             status_data = manager.get_status()
             await websocket.send_json(status_data)
             await asyncio.sleep(0.5)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════

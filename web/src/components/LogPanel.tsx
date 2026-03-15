@@ -8,7 +8,7 @@ interface LogLine {
 export default function LogPanel() {
   const [lines, setLines] = useState<string[]>([]);
   const [autoScroll, setAutoScroll] = useState(true);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const evtSource = new EventSource('/api/logs');
@@ -25,14 +25,18 @@ export default function LogPanel() {
   }, []);
 
   useEffect(() => {
-    if (autoScroll) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = containerRef.current;
+    if (autoScroll && el) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [lines, autoScroll]);
 
   return (
     <Panel title="LOGS" className="h-full flex flex-col">
-      <div className="flex-1 overflow-y-auto font-mono text-xs leading-relaxed min-h-[200px] max-h-[360px] bg-sentience-bg/50 rounded-lg p-3">
+      <div
+        ref={containerRef}
+        className="flex-1 overflow-y-auto font-mono text-xs leading-relaxed min-h-[200px] max-h-[360px] bg-sentience-bg/50 rounded-lg p-3"
+      >
         {lines.length === 0 && (
           <span className="text-sentience-muted">Waiting for logs...</span>
         )}
@@ -41,7 +45,6 @@ export default function LogPanel() {
             {line}
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
       <label className="flex items-center gap-2 mt-2 text-xs text-sentience-muted cursor-pointer">
         <input
