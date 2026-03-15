@@ -130,7 +130,7 @@ class TrainingManager:
             except Exception as e:
                 self._log(f"Failed to clean up {oldest.name}: {e}")
 
-    def start_training(self, zip_data: bytes) -> bool:
+    def start_training(self, zip_data: bytes, iterations_override: int | None = None) -> bool:
         with self._lock:
             if self.state == TrainingState.TRAINING:
                 return False
@@ -141,7 +141,8 @@ class TrainingManager:
             self.output_ply = None
             self.backend_name = None
             self.current_iteration = 0
-            self.total_iterations = self.iterations
+            self._run_iterations = iterations_override or self.iterations
+            self.total_iterations = self._run_iterations
             self.start_time = time.time()
             self._elapsed_final = None
             self._logs.clear()
@@ -382,14 +383,15 @@ class TrainingManager:
                 return
 
             backend = self._detect_backend()
+            iters = self._run_iterations
             with self._lock:
                 self.backend_name = backend
-                self.message = f"Training ({self.iterations} iters, {backend})..."
+                self.message = f"Training ({iters} iters, {backend})..."
                 self.progress = 0.2
-            self._log(f"Starting training: backend={backend}, iterations={self.iterations}")
+            self._log(f"Starting training: backend={backend}, iterations={iters}")
 
             args = argparse.Namespace(
-                iterations=self.iterations,
+                iterations=iters,
                 gs_repo=None,
             )
             output_dir = gs_pipeline.train(capture_dir, args, log_fn=self._log)

@@ -43,17 +43,18 @@ app.add_middleware(
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.post("/upload")
-async def upload(request: Request):
+async def upload(request: Request, iterations: int | None = None):
     body = await request.body()
     if len(body) == 0:
         return JSONResponse(status_code=400, content={"error": "Empty body"})
     if len(body) > 2 * 1024 * 1024 * 1024:
         return JSONResponse(status_code=413, content={"error": "Upload too large"})
 
-    if not manager.start_training(body):
+    iters = iterations if iterations and iterations > 0 else None
+    if not manager.start_training(body, iterations_override=iters):
         return JSONResponse(status_code=409, content={"error": "Training already in progress"})
 
-    return {"status": "started"}
+    return {"status": "started", "iterations": iters or manager.iterations}
 
 
 @app.get("/status")
