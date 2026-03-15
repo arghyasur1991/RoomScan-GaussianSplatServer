@@ -63,14 +63,15 @@ export default function SplatViewer({ status }: Props) {
       // Use selfDrivenMode: true — the library manages its own render loop
       // and worker-based sorting, which is critical for 335k+ gaussians
       const viewer = new Viewer({
-        cameraUp: [0, -1, 0],
-        initialCameraPosition: [0, -2, -6],
+        cameraUp: [0, 1, 0],
+        initialCameraPosition: [0, 0, 4],
         initialCameraLookAt: [0, 0, 0],
         selfDrivenMode: true,
         useBuiltInControls: true,
         dynamicScene: false,
         sharedMemoryForWorkers: false,
         rootElement: container,
+        logLevel: 1,
       });
       viewerRef.current = viewer;
 
