@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -168,8 +169,82 @@ async def api_render_image(filename: str):
     return FileResponse(path=path, media_type=media)
 
 
+def _strip_ply_sh(src: Path) -> Path:
+    """Create a lightweight PLY with only SH degree-0 (strips f_rest_*).
+    Reduces ~79MB to ~14MB for 335k gaussians."""
+    dst = src.with_name("splat_web.ply")
+    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+        return dst
+
+    with open(src, "rb") as f:
+        header_lines: list[bytes] = []
+        while True:
+            line = f.readline()
+            header_lines.append(line)
+            if line.strip() == b"end_header":
+                break
+
+        props: list[tuple[str, str]] = []
+        vertex_count = 0
+        for line in header_lines:
+            text = line.decode().strip()
+            if text.startswith("element vertex"):
+                vertex_count = int(text.split()[-1])
+            elif text.startswith("property"):
+                parts = text.split()
+                props.append((parts[1], parts[2]))
+
+        keep_indices: list[int] = []
+        keep_props: list[tuple[str, str]] = []
+        for i, (dtype, name) in enumerate(props):
+            if not name.startswith("f_rest_"):
+                keep_indices.append(i)
+                keep_props.append((dtype, name))
+
+        src_stride = len(props) * 4
+        dst_stride = len(keep_indices) * 4
+
+        new_header = "ply\nformat binary_little_endian 1.0\n"
+        new_header += f"element vertex {vertex_count}\n"
+        for dtype, name in keep_props:
+            new_header += f"property {dtype} {name}\n"
+        new_header += "end_header\n"
+
+        fmt_src = "<" + "f" * len(props)
+        fmt_dst = "<" + "f" * len(keep_indices)
+
+        data_start = f.tell()
+        with open(dst, "wb") as out:
+            out.write(new_header.encode())
+            for _ in range(vertex_count):
+                vertex = struct.unpack(fmt_src, f.read(src_stride))
+                out.write(struct.pack(fmt_dst, *(vertex[i] for i in keep_indices)))
+
+    return dst
+
+
 @app.api_route("/api/splat", methods=["GET", "HEAD"])
 async def api_splat():
+    s = manager.get_status()
+    if s["state"] != TrainingState.DONE or manager.output_ply is None:
+        return JSONResponse(status_code=404, content={"error": "No trained splat available"})
+
+    ply_path = manager.output_ply
+    if not ply_path.exists():
+        return JSONResponse(status_code=404, content={"error": "Splat PLY not found"})
+
+    web_ply = _strip_ply_sh(ply_path)
+
+    return FileResponse(
+        path=web_ply,
+        media_type="application/octet-stream",
+        filename="splat.ply",
+    )
+
+
+@app.api_route("/api/splat/full", methods=["GET", "HEAD"])
+async def api_splat_full():
+    """Serve the full PLY with all SH coefficients."""
     s = manager.get_status()
     if s["state"] != TrainingState.DONE or manager.output_ply is None:
         return JSONResponse(status_code=404, content={"error": "No trained splat available"})
