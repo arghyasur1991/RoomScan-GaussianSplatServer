@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+@theme {
+  --color-sentience-bg: #0a0c10;
+  --color-sentience-panel: #111520;
+  --color-sentience-border: rgba(0, 180, 255, 0.2);
+  --color-sentience-cyan: #00c8ff;
+  --color-sentience-cyan-dim: rgba(0, 180, 255, 0.5);
+  --color-sentience-text: #dce6f5;
+  --color-sentience-muted: #8c96aa;
+  --color-sentience-success: #00e676;
+  --color-sentience-error: #ff5252;
+  --color-sentience-warning: #ffab40;
+}
+
+body {
+  margin: 0;
+  background: var(--color-sentience-bg);
+  color: var(--color-sentience-text);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 180, 255, 0.2);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 180, 255, 0.4);
+}
+
+.btn {
+  @apply px-4 py-2 text-sm font-semibold rounded-lg border transition-colors
+    bg-sentience-panel border-sentience-border text-sentience-text
+    hover:border-sentience-cyan hover:text-sentience-cyan
+    disabled:opacity-40 disabled:pointer-events-none cursor-pointer;
+}
+.btn-primary {
+  @apply bg-sentience-cyan/15 border-sentience-cyan/50 text-sentience-cyan
+    hover:bg-sentience-cyan/25 hover:border-sentience-cyan;
+}
+.btn-danger {
+  @apply bg-sentience-error/10 border-sentience-error/40 text-sentience-error
+    hover:bg-sentience-error/20 hover:border-sentience-error;
+}
