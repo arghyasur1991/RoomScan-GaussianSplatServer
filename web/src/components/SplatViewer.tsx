@@ -7,7 +7,7 @@ interface Props {
   status: TrainingStatus;
 }
 
-type ViewerState = 'idle' | 'downloading' | 'processing' | 'ready' | 'error';
+type ViewerState = 'idle' | 'loading' | 'ready' | 'error';
 
 export default function SplatViewer({ status }: Props) {
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -40,8 +40,8 @@ export default function SplatViewer({ status }: Props) {
 
     if (!canvasRef.current) return;
 
-    setViewerState('downloading');
-    setProgress('Checking availability...');
+    setViewerState('loading');
+    setProgress('Checking...');
     setError('');
 
     try {
@@ -49,47 +49,64 @@ export default function SplatViewer({ status }: Props) {
       if (!probe.ok) throw new Error(`Splat not available (HTTP ${probe.status})`);
       if (cancelledRef.current) return;
 
-      const contentLength = probe.headers.get('content-length');
-      const sizeMB = contentLength ? (parseInt(contentLength) / 1048576).toFixed(1) : '?';
-      setProgress(`Downloading ${sizeMB} MB...`);
-
+      setProgress('Loading viewer...');
       const { Viewer } = await import('@mkkellogg/gaussian-splats-3d');
       if (cancelledRef.current || !canvasRef.current) return;
 
       const container = canvasRef.current;
       const width = container.clientWidth || 600;
       const height = container.clientHeight || 400;
+      console.log(`SplatViewer container: ${width}x${height}`);
 
-      // Use selfDrivenMode: true — the library manages its own render loop
-      // and worker-based sorting, which is critical for 335k+ gaussians
+      const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+      renderer.setSize(width, height);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setClearColor(0x111111);
+      container.appendChild(renderer.domElement);
+      rendererRef.current = renderer;
+
+      const camera = new THREE.PerspectiveCamera(65, width / height, 0.1, 100);
+      camera.position.set(0, 0, 3);
+      camera.lookAt(0, 0, 0);
+
+      const scene = new THREE.Scene();
+
+      const { OrbitControls } = await import('three/examples/jsm/controls/OrbitControls.js');
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.1;
+      controls.target.set(0, 0, 0);
+      controlsRef.current = controls;
+
+      // Start render loop immediately
+      const animate = () => {
+        if (cancelledRef.current) return;
+        frameRef.current = requestAnimationFrame(animate);
+        controls.update();
+        viewer.update();
+        viewer.render();
+      };
+
       const viewer = new Viewer({
-        cameraUp: [0, 1, 0],
-        initialCameraPosition: [0, 0, 4],
-        initialCameraLookAt: [0, 0, 0],
-        selfDrivenMode: true,
-        useBuiltInControls: true,
-        dynamicScene: false,
+        scene,
+        renderer,
+        camera,
+        selfDrivenMode: false,
         sharedMemoryForWorkers: false,
-        rootElement: container,
-        logLevel: 1,
       });
       viewerRef.current = viewer;
+      animate();
 
-      setViewerState('downloading');
+      setProgress('Downloading splat...');
       console.time('addSplatScene');
 
       await viewer.addSplatScene('/api/splat', {
-        showLoadingUI: true,
-        format: 0, /* SceneFormat.Splat */
-        splatAlphaRemovalThreshold: 10,
-        onProgress: (_percent: number, label: string, loaderStatus: number) => {
-          console.timeLog('addSplatScene', `${label} status=${loaderStatus}`);
-          if (loaderStatus === 0) {
-            setProgress(`Downloading... ${label}`);
-          } else {
-            setViewerState('processing');
-            setProgress('');
-          }
+        showLoadingUI: false,
+        format: 0,
+        splatAlphaRemovalThreshold: 5,
+        onProgress: (_p: number, label: string, status: number) => {
+          if (status === 0) setProgress(`Downloading... ${label}`);
+          else setProgress('Processing...');
         },
       });
       console.timeEnd('addSplatScene');
@@ -97,6 +114,16 @@ export default function SplatViewer({ status }: Props) {
       if (cancelledRef.current) return;
       setViewerState('ready');
       console.log('Splat viewer ready');
+
+      const handleResize = () => {
+        if (cancelledRef.current || !container) return;
+        const w = container.clientWidth || 600;
+        const h = container.clientHeight || 400;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      };
+      window.addEventListener('resize', handleResize);
 
     } catch (e: any) {
       console.error('SplatViewer error:', e);
@@ -124,18 +151,17 @@ export default function SplatViewer({ status }: Props) {
   return (
     <Panel title="GAUSSIAN SPLAT" className="h-full flex flex-col">
       <div className="relative flex-1 rounded-lg overflow-hidden bg-sentience-bg border border-sentience-border min-h-[400px]">
-        {/* Library creates its own canvas + controls inside this div */}
         <div ref={canvasRef} className="absolute inset-0" />
 
-        {viewerState !== 'ready' && viewerState !== 'processing' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
+        {viewerState !== 'ready' && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none z-10">
             {viewerState === 'idle' && !isDone && (
               <span className="text-sentience-muted text-sm">
                 Splat viewer will appear after training completes.
               </span>
             )}
 
-            {viewerState === 'downloading' && (
+            {viewerState === 'loading' && (
               <>
                 <div className="w-8 h-8 border-2 border-sentience-cyan border-t-transparent rounded-full animate-spin" />
                 <span className="text-sentience-cyan text-sm">{progress}</span>
@@ -143,17 +169,14 @@ export default function SplatViewer({ status }: Props) {
             )}
 
             {viewerState === 'error' && (
-              <>
+              <div className="pointer-events-auto flex flex-col items-center gap-2">
                 <span className="text-sentience-error text-sm">{error}</span>
                 {isDone && (
-                  <button
-                    onClick={loadSplat}
-                    className="btn btn-primary text-xs mt-2"
-                  >
+                  <button onClick={loadSplat} className="btn btn-primary text-xs">
                     Retry
                   </button>
                 )}
-              </>
+              </div>
             )}
           </div>
         )}
