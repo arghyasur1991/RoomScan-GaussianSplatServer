@@ -6,6 +6,8 @@ PC training server + web dashboard for [QuestRoomScan](https://github.com/arghya
 
 Receives captured keyframes and point cloud from a Meta Quest headset, runs COLMAP conversion + Gaussian Splat training, and serves the trained model back. Includes a real-time web dashboard for monitoring training, browsing keyframes, and interactively viewing point clouds and trained splats.
 
+![Web Dashboard](docs/gs-webapp.png)
+
 ## Quick Start
 
 ```bash
