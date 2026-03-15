@@ -62,7 +62,7 @@ export default function SplatViewer({ status }: Props) {
         viewerRef.current = viewer;
 
         const splatUrl = `${window.location.origin}/api/splat`;
-        await viewer.addSplatScene(splatUrl, { showLoadingUI: false });
+        await viewer.addSplatScene(splatUrl, { showLoadingUI: false, format: 2 /* SceneFormat.Ply */ });
 
         if (cancelled) return;
 
