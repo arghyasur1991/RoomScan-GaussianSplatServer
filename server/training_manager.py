@@ -38,6 +38,9 @@ _ITER_PATTERNS = [
     re.compile(r"step\s*=\s*(\d+).*?max_steps\s*=\s*(\d+)", re.IGNORECASE),
 ]
 
+# msplat outputs "step=  100  splats= 35,071  ms=4.9" — no total in the line
+_MSPLAT_STEP_PATTERN = re.compile(r"step\s*=\s*(\d+)")
+
 
 class TrainingManager:
     LOG_RING_SIZE = 5000
@@ -183,6 +186,15 @@ class TrainingManager:
                     self.message = f"Training... {current}/{total}"
                 return
 
+        m = _MSPLAT_STEP_PATTERN.search(line)
+        if m:
+            current = int(m.group(1))
+            with self._lock:
+                self.current_iteration = current
+                total = self.total_iterations or self.iterations
+                self.progress = 0.2 + 0.8 * (current / max(total, 1))
+                self.message = f"Training... {current}/{total}"
+
     def _run(self, zip_data: bytes):
         try:
             capture_dir = self.work_dir / "current_run"
@@ -228,7 +240,7 @@ class TrainingManager:
                 iterations=self.iterations,
                 gs_repo=None,
             )
-            output_dir = gs_pipeline.train(capture_dir, args)
+            output_dir = gs_pipeline.train(capture_dir, args, log_fn=self._log)
 
             if self._cancel.is_set():
                 return

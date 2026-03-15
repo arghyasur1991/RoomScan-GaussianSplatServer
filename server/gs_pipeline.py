@@ -18,6 +18,7 @@ Requirements:
 
 import argparse
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -257,16 +258,61 @@ def write_colmap_points3d_bin(path: Path, points: list):
 # Training backends
 # ---------------------------------------------------------------------------
 
-def train(capture_dir: Path, args):
+def _run_with_logging(cmd: list, log_fn=None):
+    """Run a subprocess, streaming stdout/stderr line-by-line to log_fn.
+
+    Handles both \\n and \\r as line terminators (msplat uses \\r for
+    in-place progress updates).
+    """
+    log_fn = log_fn or print
+    log_fn(f"Running: {' '.join(cmd)}")
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+
+    buf = b""
+    while True:
+        chunk = proc.stdout.read(1)
+        if not chunk:
+            break
+        if chunk in (b"\n", b"\r"):
+            if buf:
+                line = buf.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    log_fn(line)
+                    print(line, flush=True)
+                buf = b""
+        else:
+            buf += chunk
+
+    if buf:
+        line = buf.decode("utf-8", errors="replace").rstrip()
+        if line:
+            log_fn(line)
+            print(line, flush=True)
+
+    proc.wait()
+    return proc.returncode
+
+
+def train(capture_dir: Path, args, log_fn=None):
     """Auto-detect and run the best available GS training backend."""
+    log_fn = log_fn or print
     output_dir = capture_dir / "output"
     output_dir.mkdir(exist_ok=True)
 
     # msplat (Metal, Apple Silicon)
     try:
         import msplat  # noqa: F401
-        print("Using msplat (Metal) for training...")
-        train_msplat(capture_dir, output_dir, args)
+        log_fn("Using msplat (Metal) for training...")
+        train_msplat(capture_dir, output_dir, args, log_fn)
         return output_dir
     except ImportError:
         pass
@@ -274,8 +320,8 @@ def train(capture_dir: Path, args):
     # gsplat (CUDA)
     try:
         import gsplat  # noqa: F401
-        print("Using gsplat for training...")
-        train_gsplat(capture_dir, output_dir, args)
+        log_fn("Using gsplat for training...")
+        train_gsplat(capture_dir, output_dir, args, log_fn)
         return output_dir
     except ImportError:
         pass
@@ -283,19 +329,20 @@ def train(capture_dir: Path, args):
     # Original 3DGS repo
     gs_repo = Path(args.gs_repo) if args.gs_repo else None
     if gs_repo and gs_repo.exists():
-        print(f"Using 3DGS repo at {gs_repo}...")
-        train_3dgs(capture_dir, output_dir, gs_repo, args)
+        log_fn(f"Using 3DGS repo at {gs_repo}...")
+        train_3dgs(capture_dir, output_dir, gs_repo, args, log_fn)
         return output_dir
 
-    print("ERROR: No Gaussian Splatting training backend found.")
-    print("Install one of:")
-    print("  pip install msplat[cli]   (Apple Silicon, Metal)")
-    print("  pip install gsplat        (NVIDIA GPU, CUDA)")
-    print("  --gs-repo /path/to/gaussian-splatting  (original 3DGS)")
+    log_fn("ERROR: No Gaussian Splatting training backend found.")
+    log_fn("Install one of:")
+    log_fn("  pip install msplat[cli]   (Apple Silicon, Metal)")
+    log_fn("  pip install gsplat        (NVIDIA GPU, CUDA)")
+    log_fn("  --gs-repo /path/to/gaussian-splatting  (original 3DGS)")
     sys.exit(1)
 
 
-def train_msplat(capture_dir: Path, output_dir: Path, args):
+def train_msplat(capture_dir: Path, output_dir: Path, args, log_fn=None):
+    save_interval = max(args.iterations // 5, 500)
     cmd = [
         sys.executable, "-m", "msplat.cli",
         "--input", str(capture_dir),
@@ -303,16 +350,17 @@ def train_msplat(capture_dir: Path, output_dir: Path, args):
         "--num-iters", str(args.iterations),
         "--num-downscales", "0",
         "--eval",
+        "--save-every", str(save_interval),
     ]
-    print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
+    rc = _run_with_logging(cmd, log_fn)
+    if rc != 0:
         cmd[0:3] = ["msplat-train"]
-        print(f"Retrying: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
+        rc = _run_with_logging(cmd, log_fn)
+        if rc != 0:
+            raise RuntimeError(f"msplat training failed with exit code {rc}")
 
 
-def train_gsplat(capture_dir: Path, output_dir: Path, args):
+def train_gsplat(capture_dir: Path, output_dir: Path, args, log_fn=None):
     cmd = [
         sys.executable, "-m", "gsplat", "fit",
         "--data_dir", str(capture_dir),
@@ -321,19 +369,21 @@ def train_gsplat(capture_dir: Path, output_dir: Path, args):
         "--max_steps", str(args.iterations),
         "--init_type", "sfm",
     ]
-    print(f"Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    rc = _run_with_logging(cmd, log_fn)
+    if rc != 0:
+        raise RuntimeError(f"gsplat training failed with exit code {rc}")
 
 
-def train_3dgs(capture_dir: Path, output_dir: Path, gs_repo: Path, args):
+def train_3dgs(capture_dir: Path, output_dir: Path, gs_repo: Path, args, log_fn=None):
     cmd = [
         sys.executable, str(gs_repo / "train.py"),
         "-s", str(capture_dir),
         "-m", str(output_dir),
         "--iterations", str(args.iterations),
     ]
-    print(f"Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    rc = _run_with_logging(cmd, log_fn)
+    if rc != 0:
+        raise RuntimeError(f"3DGS training failed with exit code {rc}")
 
 
 # ---------------------------------------------------------------------------
