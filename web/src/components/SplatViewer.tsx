@@ -102,7 +102,7 @@ export default function SplatViewer({ status }: Props) {
 
       await viewer.addSplatScene('/api/splat', {
         showLoadingUI: false,
-        format: 0,
+        format: 2, /* SceneFormat.Ply — full PLY with all gaussians */
         splatAlphaRemovalThreshold: 5,
         onProgress: (_p: number, label: string, status: number) => {
           if (status === 0) setProgress(`Downloading... ${label}`);

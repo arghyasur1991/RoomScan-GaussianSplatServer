@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import struct
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -169,89 +168,6 @@ async def api_render_image(filename: str):
     return FileResponse(path=path, media_type=media)
 
 
-MAX_WEB_GAUSSIANS = 100_000
-
-def _ply_to_splat(src: Path) -> Path:
-    """Convert 3DGS PLY to .splat format, keeping only the top gaussians by opacity.
-
-    .splat layout per gaussian (32 bytes):
-      float32 x, y, z          (12 bytes) - position
-      float32 sx, sy, sz       (12 bytes) - scale (exp of log-scale)
-      uint8   r, g, b, a       ( 4 bytes) - SH0→RGB + sigmoid(opacity)
-      uint8   q0, q1, q2, q3   ( 4 bytes) - rotation quaternion [0..255]
-    """
-    import math
-    dst = src.with_name("splat_web.splat")
-    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
-        return dst
-
-    SH_C0 = 0.28209479177387814
-
-    with open(src, "rb") as f:
-        header_lines: list[bytes] = []
-        while True:
-            line = f.readline()
-            header_lines.append(line)
-            if line.strip() == b"end_header":
-                break
-
-        prop_names: list[str] = []
-        vertex_count = 0
-        for line in header_lines:
-            text = line.decode().strip()
-            if text.startswith("element vertex"):
-                vertex_count = int(text.split()[-1])
-            elif text.startswith("property"):
-                prop_names.append(text.split()[2])
-
-        idx = {name: i for i, name in enumerate(prop_names)}
-        src_stride = len(prop_names) * 4
-        fmt_src = "<" + "f" * len(prop_names)
-
-        gaussians: list[tuple[float, bytes]] = []
-
-        for _ in range(vertex_count):
-            v = struct.unpack(fmt_src, f.read(src_stride))
-
-            x, y, z = v[idx["x"]], v[idx["y"]], v[idx["z"]]
-            sx = math.exp(v[idx["scale_0"]])
-            sy = math.exp(v[idx["scale_1"]])
-            sz = math.exp(v[idx["scale_2"]])
-
-            r = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_0"]]) * 255)))
-            g = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_1"]]) * 255)))
-            b = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_2"]]) * 255)))
-            opacity = 1.0 / (1.0 + math.exp(-v[idx["opacity"]]))
-            a = int(max(0, min(255, opacity * 255)))
-
-            qw = v[idx["rot_0"]]
-            qx = v[idx["rot_1"]]
-            qy = v[idx["rot_2"]]
-            qz = v[idx["rot_3"]]
-            norm = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz) or 1.0
-            qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
-
-            row = struct.pack("<fff", x, y, z)
-            row += struct.pack("<fff", sx, sy, sz)
-            row += struct.pack("BBBB", r, g, b, a)
-            row += struct.pack("BBBB",
-                int((qw * 0.5 + 0.5) * 255),
-                int((qx * 0.5 + 0.5) * 255),
-                int((qy * 0.5 + 0.5) * 255),
-                int((qz * 0.5 + 0.5) * 255),
-            )
-            gaussians.append((opacity, row))
-
-    if len(gaussians) > MAX_WEB_GAUSSIANS:
-        gaussians.sort(key=lambda g: g[0], reverse=True)
-        gaussians = gaussians[:MAX_WEB_GAUSSIANS]
-
-    with open(dst, "wb") as out:
-        for _, row in gaussians:
-            out.write(row)
-
-    return dst
-
 
 @app.api_route("/api/splat", methods=["GET", "HEAD"])
 async def api_splat():
@@ -263,12 +179,10 @@ async def api_splat():
     if not ply_path.exists():
         return JSONResponse(status_code=404, content={"error": "Splat PLY not found"})
 
-    web_splat = _ply_to_splat(ply_path)
-
     return FileResponse(
-        path=web_splat,
+        path=ply_path,
         media_type="application/octet-stream",
-        filename="scene.splat",
+        filename="splat.ply",
     )
 
 
