@@ -3,3 +3,4 @@ uvicorn[standard]
 numpy
 scipy
 plyfile
+msplat[cli]
