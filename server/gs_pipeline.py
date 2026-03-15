@@ -215,25 +215,26 @@ def convert_to_colmap(capture_dir: Path, frames: list):
             f.write(struct.pack("<Q", 0))
         print("points3D.bin: empty (no PLY found)")
 
-    # Compute and save scene normalization params (center + scale of camera
-    # positions in COLMAP space). msplat normalizes internally using these but
-    # doesn't expose them, so we recompute to denormalize the output PLY.
+    # Compute and save scene normalization params matching msplat's
+    # autoScaleAndCenter (input_data.cpp): center = mean(cam_positions),
+    # scale = 1 / max(abs(centered_positions)) per component.
     cam_positions = []
     for frame in frames:
         cam_positions.append([frame["px"], -frame["py"], frame["pz"]])
     cam_positions = np.array(cam_positions)
     scene_center = cam_positions.mean(axis=0)
-    dists = np.linalg.norm(cam_positions - scene_center, axis=1)
-    scene_avg_dist = float(dists.mean())
+    centered = cam_positions - scene_center
+    max_abs = float(np.max(np.abs(centered)))
+    scene_scale = (1.0 / max_abs) if max_abs > 0 else 1.0
 
     norm_params = {
         "center": scene_center.tolist(),
-        "avg_dist": scene_avg_dist,
+        "scale": scene_scale,
     }
     norm_path = capture_dir / "scene_norm.json"
     with open(norm_path, "w") as f:
         json.dump(norm_params, f)
-    print(f"Scene normalization: center={scene_center}, avg_dist={scene_avg_dist:.4f}")
+    print(f"Scene normalization: center={scene_center}, scale={scene_scale:.6f} (1/maxAbs={max_abs:.4f})")
 
     print(f"COLMAP binary files written to {sparse_dir}")
     return sparse_dir
@@ -350,9 +351,10 @@ def _run_with_logging(cmd: list, log_fn=None):
 def denormalize_ply(ply_path: Path, norm_path: Path, log_fn=None):
     """Undo msplat's internal scene normalization on the trained PLY.
 
-    msplat normalizes positions as: P_norm = (P_colmap - center) / avg_dist
-    This reverses it: P_colmap = P_norm * avg_dist + center
-    Gaussian scales (log-space) are adjusted: s_world = s_norm + ln(avg_dist)
+    msplat normalizes as: P_norm = (P_colmap - center) * scale
+    where scale = 1 / max(abs(centered_cam_positions)).
+    This reverses it: P_colmap = P_norm / scale + center
+    Gaussian scales (log-space): s_world = log(exp(s_norm) / scale)
     """
     import math
 
@@ -366,10 +368,17 @@ def denormalize_ply(ply_path: Path, norm_path: Path, log_fn=None):
     with open(norm_path) as f:
         params = json.load(f)
     center = params["center"]
-    avg_dist = params["avg_dist"]
-    log_scale_offset = math.log(avg_dist)
+    # Support both old ("avg_dist") and new ("scale") format
+    if "scale" in params:
+        scale = params["scale"]
+    else:
+        avg_dist = params["avg_dist"]
+        scale = 1.0 / avg_dist if avg_dist > 0 else 1.0
+        log_fn(f"WARNING: using legacy avg_dist format, results may be slightly off")
+    inv_scale = 1.0 / scale
+    log_scale_offset = math.log(inv_scale)
 
-    log_fn(f"Denormalizing PLY: center={center}, avg_dist={avg_dist:.4f}")
+    log_fn(f"Denormalizing PLY: center={center}, scale={scale:.6f}, inv_scale={inv_scale:.4f}")
 
     with open(ply_path, "rb") as f:
         header_lines = []
@@ -406,9 +415,9 @@ def denormalize_ply(ply_path: Path, norm_path: Path, log_fn=None):
 
     for i in range(vertex_count):
         base = i * len(props)
-        data[base + idx_x] = data[base + idx_x] * avg_dist + center[0]
-        data[base + idx_y] = data[base + idx_y] * avg_dist + center[1]
-        data[base + idx_z] = data[base + idx_z] * avg_dist + center[2]
+        data[base + idx_x] = data[base + idx_x] * inv_scale + center[0]
+        data[base + idx_y] = data[base + idx_y] * inv_scale + center[1]
+        data[base + idx_z] = data[base + idx_z] * inv_scale + center[2]
         if idx_s0 >= 0:
             data[base + idx_s0] += log_scale_offset
         if idx_s1 >= 0:
@@ -433,12 +442,11 @@ def train(capture_dir: Path, args, log_fn=None):
 
     norm_path = capture_dir / "scene_norm.json"
 
-    # msplat (Metal, Apple Silicon)
+    # msplat (Metal, Apple Silicon) — uses --keep-crs so PLY is already in world coords
     try:
         import msplat  # noqa: F401
         log_fn("Using msplat (Metal) for training...")
         train_msplat(capture_dir, output_dir, args, log_fn)
-        denormalize_ply(output_dir / "splat.ply", norm_path, log_fn)
         return output_dir
     except ImportError:
         pass
@@ -478,6 +486,7 @@ def train_msplat(capture_dir: Path, output_dir: Path, args, log_fn=None):
         "--num-iters", str(args.iterations),
         "--num-downscales", "0",
         "--eval",
+        "--keep-crs",
         "--save-every", str(save_interval),
     ]
     rc = _run_with_logging(cmd, log_fn)
