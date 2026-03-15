@@ -84,6 +84,9 @@ export default function SplatViewer({ status }: Props) {
           console.timeLog('addSplatScene', `${label} status=${loaderStatus}`);
           if (loaderStatus === 0) {
             setProgress(`Downloading... ${label}`);
+          } else {
+            setViewerState('processing');
+            setProgress('');
           }
         },
       });
@@ -122,7 +125,7 @@ export default function SplatViewer({ status }: Props) {
         {/* Library creates its own canvas + controls inside this div */}
         <div ref={canvasRef} className="absolute inset-0" />
 
-        {viewerState !== 'ready' && (
+        {viewerState !== 'ready' && viewerState !== 'processing' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
             {viewerState === 'idle' && !isDone && (
               <span className="text-sentience-muted text-sm">
@@ -130,7 +133,7 @@ export default function SplatViewer({ status }: Props) {
               </span>
             )}
 
-            {(viewerState === 'downloading' || viewerState === 'processing') && (
+            {viewerState === 'downloading' && (
               <>
                 <div className="w-8 h-8 border-2 border-sentience-cyan border-t-transparent rounded-full animate-spin" />
                 <span className="text-sentience-cyan text-sm">{progress}</span>

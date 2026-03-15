@@ -169,8 +169,10 @@ async def api_render_image(filename: str):
     return FileResponse(path=path, media_type=media)
 
 
+MAX_WEB_GAUSSIANS = 100_000
+
 def _ply_to_splat(src: Path) -> Path:
-    """Convert 3DGS PLY to .splat format (32 bytes/gaussian) for fast web loading.
+    """Convert 3DGS PLY to .splat format, keeping only the top gaussians by opacity.
 
     .splat layout per gaussian (32 bytes):
       float32 x, y, z          (12 bytes) - position
@@ -206,36 +208,47 @@ def _ply_to_splat(src: Path) -> Path:
         src_stride = len(prop_names) * 4
         fmt_src = "<" + "f" * len(prop_names)
 
-        with open(dst, "wb") as out:
-            for _ in range(vertex_count):
-                v = struct.unpack(fmt_src, f.read(src_stride))
+        gaussians: list[tuple[float, bytes]] = []
 
-                x, y, z = v[idx["x"]], v[idx["y"]], v[idx["z"]]
-                sx = math.exp(v[idx["scale_0"]])
-                sy = math.exp(v[idx["scale_1"]])
-                sz = math.exp(v[idx["scale_2"]])
+        for _ in range(vertex_count):
+            v = struct.unpack(fmt_src, f.read(src_stride))
 
-                r = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_0"]]) * 255)))
-                g = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_1"]]) * 255)))
-                b = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_2"]]) * 255)))
-                a = int(max(0, min(255, 1.0 / (1.0 + math.exp(-v[idx["opacity"]])) * 255)))
+            x, y, z = v[idx["x"]], v[idx["y"]], v[idx["z"]]
+            sx = math.exp(v[idx["scale_0"]])
+            sy = math.exp(v[idx["scale_1"]])
+            sz = math.exp(v[idx["scale_2"]])
 
-                qw = v[idx["rot_0"]]
-                qx = v[idx["rot_1"]]
-                qy = v[idx["rot_2"]]
-                qz = v[idx["rot_3"]]
-                norm = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz) or 1.0
-                qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
+            r = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_0"]]) * 255)))
+            g = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_1"]]) * 255)))
+            b = int(max(0, min(255, (0.5 + SH_C0 * v[idx["f_dc_2"]]) * 255)))
+            opacity = 1.0 / (1.0 + math.exp(-v[idx["opacity"]]))
+            a = int(max(0, min(255, opacity * 255)))
 
-                out.write(struct.pack("<fff", x, y, z))
-                out.write(struct.pack("<fff", sx, sy, sz))
-                out.write(struct.pack("BBBB", r, g, b, a))
-                out.write(struct.pack("BBBB",
-                    int((qw * 0.5 + 0.5) * 255),
-                    int((qx * 0.5 + 0.5) * 255),
-                    int((qy * 0.5 + 0.5) * 255),
-                    int((qz * 0.5 + 0.5) * 255),
-                ))
+            qw = v[idx["rot_0"]]
+            qx = v[idx["rot_1"]]
+            qy = v[idx["rot_2"]]
+            qz = v[idx["rot_3"]]
+            norm = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz) or 1.0
+            qw, qx, qy, qz = qw/norm, qx/norm, qy/norm, qz/norm
+
+            row = struct.pack("<fff", x, y, z)
+            row += struct.pack("<fff", sx, sy, sz)
+            row += struct.pack("BBBB", r, g, b, a)
+            row += struct.pack("BBBB",
+                int((qw * 0.5 + 0.5) * 255),
+                int((qx * 0.5 + 0.5) * 255),
+                int((qy * 0.5 + 0.5) * 255),
+                int((qz * 0.5 + 0.5) * 255),
+            )
+            gaussians.append((opacity, row))
+
+    if len(gaussians) > MAX_WEB_GAUSSIANS:
+        gaussians.sort(key=lambda g: g[0], reverse=True)
+        gaussians = gaussians[:MAX_WEB_GAUSSIANS]
+
+    with open(dst, "wb") as out:
+        for _, row in gaussians:
+            out.write(row)
 
     return dst
 
