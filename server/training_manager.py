@@ -61,6 +61,20 @@ class TrainingManager:
         self._logs: deque[str] = deque(maxlen=self.LOG_RING_SIZE)
         self._log_counter = 0
 
+        self._restore_previous_run()
+
+    def _restore_previous_run(self):
+        """If a previous run's output exists on disk, restore 'done' state."""
+        run_dir = self.work_dir / "current_run"
+        ply = run_dir / "output" / "splat.ply"
+        if ply.exists():
+            self.state = TrainingState.DONE
+            self.progress = 1.0
+            self.output_ply = ply
+            self.capture_dir = run_dir
+            self.message = f"Previous run restored: {ply.name}"
+            self._log(f"Restored previous training output: {ply}")
+
     def start_training(self, zip_data: bytes) -> bool:
         with self._lock:
             if self.state == TrainingState.TRAINING:

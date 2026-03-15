@@ -28,8 +28,15 @@ export default function SplatViewer({ status }: Props) {
 
     (async () => {
       try {
-        const { Viewer } = await import('@mkkellogg/gaussian-splats-3d');
+        const splatUrl = `/api/splat`;
 
+        const probe = await fetch(splatUrl, { method: 'HEAD' });
+        if (!probe.ok) {
+          throw new Error(`Splat not available (${probe.status})`);
+        }
+        if (cancelled) return;
+
+        const { Viewer } = await import('@mkkellogg/gaussian-splats-3d');
         if (cancelled || !canvasRef.current) return;
 
         const container = canvasRef.current;
@@ -61,7 +68,6 @@ export default function SplatViewer({ status }: Props) {
         });
         viewerRef.current = viewer;
 
-        const splatUrl = `${window.location.origin}/api/splat`;
         await viewer.addSplatScene(splatUrl, { showLoadingUI: false, format: 2 /* SceneFormat.Ply */ });
 
         if (cancelled) return;
