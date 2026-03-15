@@ -225,6 +225,63 @@ class TrainingManager:
             self.start_time = None
         return True
 
+    def delete_run(self, run_name: str) -> bool:
+        """Delete a single run directory. Cannot delete while training or if it's the active run."""
+        target = self.runs_dir / run_name
+        if not target.is_dir():
+            return False
+
+        is_current = (
+            self.current_link.is_symlink()
+            and self.current_link.resolve() == target.resolve()
+        )
+        if is_current:
+            if self.current_link.is_symlink():
+                self.current_link.unlink()
+            with self._lock:
+                self.state = TrainingState.IDLE
+                self.progress = 0.0
+                self.message = "Ready"
+                self.output_ply = None
+                self.capture_dir = None
+                self._run_name = None
+                self._elapsed_final = None
+                self.start_time = None
+
+        try:
+            shutil.rmtree(target)
+            self._log(f"Deleted run: {run_name}")
+            return True
+        except Exception as e:
+            self._log(f"Failed to delete {run_name}: {e}")
+            return False
+
+    def delete_all_runs(self) -> int:
+        """Delete all run directories. Returns the number deleted."""
+        if self.current_link.is_symlink() or self.current_link.exists():
+            self.current_link.unlink()
+
+        with self._lock:
+            self.state = TrainingState.IDLE
+            self.progress = 0.0
+            self.message = "Ready"
+            self.output_ply = None
+            self.capture_dir = None
+            self._run_name = None
+            self._elapsed_final = None
+            self.start_time = None
+
+        count = 0
+        for d in list(self.runs_dir.iterdir()):
+            if d.is_dir():
+                try:
+                    shutil.rmtree(d)
+                    count += 1
+                except Exception as e:
+                    self._log(f"Failed to delete {d.name}: {e}")
+        self._log(f"Cleared all runs ({count} deleted)")
+        return count
+
     def _freeze_elapsed(self):
         """Snapshot elapsed time so it stops ticking. Must be called under _lock."""
         if self.start_time is not None:

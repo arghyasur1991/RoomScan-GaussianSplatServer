@@ -112,6 +112,23 @@ async def api_activate_run(run_name: str):
     return JSONResponse(status_code=404, content={"error": f"Run '{run_name}' not found or has no PLY"})
 
 
+@app.delete("/api/runs/{run_name}")
+async def api_delete_run(run_name: str):
+    if manager.state == TrainingState.TRAINING:
+        return JSONResponse(status_code=409, content={"error": "Cannot delete while training"})
+    if manager.delete_run(run_name):
+        return {"status": "ok", "deleted": run_name}
+    return JSONResponse(status_code=404, content={"error": f"Run '{run_name}' not found"})
+
+
+@app.delete("/api/runs")
+async def api_delete_all_runs():
+    if manager.state == TrainingState.TRAINING:
+        return JSONResponse(status_code=409, content={"error": "Cannot delete while training"})
+    count = manager.delete_all_runs()
+    return {"status": "ok", "deleted_count": count}
+
+
 @app.get("/api/keyframes")
 async def api_keyframes():
     if manager.capture_dir is None:

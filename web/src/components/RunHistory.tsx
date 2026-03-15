@@ -16,6 +16,11 @@ interface Props {
 export default function RunHistory({ status }: Props) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [switching, setSwitching] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [clearingAll, setClearingAll] = useState(false);
+
+  const isTraining = status.state === 'training';
+  const busy = switching !== null || deleting !== null || clearingAll;
 
   const fetchRuns = useCallback(() => {
     fetch('/api/runs')
@@ -37,6 +42,28 @@ export default function RunHistory({ status }: Props) {
       setSwitching(null);
     }
   }, [fetchRuns]);
+
+  const deleteRun = useCallback(async (name: string) => {
+    if (!confirm(`Delete run "${name}"? This cannot be undone.`)) return;
+    setDeleting(name);
+    try {
+      await fetch(`/api/runs/${name}`, { method: 'DELETE' });
+      fetchRuns();
+    } catch { /* ignore */ } finally {
+      setDeleting(null);
+    }
+  }, [fetchRuns]);
+
+  const deleteAll = useCallback(async () => {
+    if (!confirm(`Delete ALL ${runs.length} runs? This cannot be undone.`)) return;
+    setClearingAll(true);
+    try {
+      await fetch('/api/runs', { method: 'DELETE' });
+      fetchRuns();
+    } catch { /* ignore */ } finally {
+      setClearingAll(false);
+    }
+  }, [fetchRuns, runs.length]);
 
   if (runs.length === 0) return null;
 
@@ -68,7 +95,7 @@ export default function RunHistory({ status }: Props) {
               ) : run.has_ply ? (
                 <button
                   onClick={() => activate(run.name)}
-                  disabled={switching !== null || status.state === 'training'}
+                  disabled={busy || isTraining}
                   className="btn btn-sm"
                 >
                   {switching === run.name ? 'Loading...' : 'Load'}
@@ -76,10 +103,27 @@ export default function RunHistory({ status }: Props) {
               ) : (
                 <span className="text-sentience-muted">No PLY</span>
               )}
+              <button
+                onClick={() => deleteRun(run.name)}
+                disabled={busy || isTraining}
+                className="btn btn-sm !bg-red-900/40 !border-red-700/50 hover:!bg-red-800/60 !text-red-300"
+                title={`Delete ${run.name}`}
+              >
+                {deleting === run.name ? '...' : '✕'}
+              </button>
             </div>
           </div>
         ))}
       </div>
+      {runs.length > 1 && (
+        <button
+          onClick={deleteAll}
+          disabled={busy || isTraining}
+          className="btn btn-sm w-full mt-2 !bg-red-900/30 !border-red-700/40 hover:!bg-red-800/50 !text-red-300"
+        >
+          {clearingAll ? 'Clearing...' : `Clear All Runs (${runs.length})`}
+        </button>
+      )}
     </Panel>
   );
 }
