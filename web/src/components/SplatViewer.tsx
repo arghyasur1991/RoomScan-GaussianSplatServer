@@ -50,7 +50,7 @@ export default function SplatViewer({ status }: Props) {
       if (cancelledRef.current) return;
 
       const contentLength = probe.headers.get('content-length');
-      const sizeMB = contentLength ? (parseInt(contentLength) / 1048576).toFixed(0) : '?';
+      const sizeMB = contentLength ? (parseInt(contentLength) / 1048576).toFixed(1) : '?';
       setProgress(`Downloading ${sizeMB} MB...`);
 
       const { Viewer } = await import('@mkkellogg/gaussian-splats-3d');
@@ -60,75 +60,41 @@ export default function SplatViewer({ status }: Props) {
       const width = container.clientWidth || 600;
       const height = container.clientHeight || 400;
 
-      const renderer = new THREE.WebGLRenderer({ antialias: true });
-      renderer.setSize(width, height);
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-      container.appendChild(renderer.domElement);
-      rendererRef.current = renderer;
-
-      const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 500);
-      camera.position.set(2, 2, 2);
-
-      const scene = new THREE.Scene();
-
-      const { OrbitControls } = await import('three/examples/jsm/controls/OrbitControls.js');
-      const controls = new OrbitControls(camera, renderer.domElement);
-      controls.enableDamping = true;
-      controls.dampingFactor = 0.1;
-      controlsRef.current = controls;
-
+      // Use selfDrivenMode: true — the library manages its own render loop
+      // and worker-based sorting, which is critical for 335k+ gaussians
       const viewer = new Viewer({
-        scene,
-        renderer,
-        camera,
-        selfDrivenMode: false,
+        cameraUp: [0, -1, 0],
+        initialCameraPosition: [0, -2, -6],
+        initialCameraLookAt: [0, 0, 0],
+        selfDrivenMode: true,
+        useBuiltInControls: true,
+        dynamicScene: false,
+        rootElement: container,
       });
       viewerRef.current = viewer;
-
-      // Start render loop immediately so progressive splats are visible
-      const animate = () => {
-        if (cancelledRef.current) return;
-        frameRef.current = requestAnimationFrame(animate);
-        controls.update();
-        viewer.update();
-        viewer.render();
-      };
-      animate();
 
       setViewerState('downloading');
       console.time('addSplatScene');
 
       await viewer.addSplatScene('/api/splat', {
-        showLoadingUI: false,
-        format: 0, /* SceneFormat.Splat — compact 32-byte binary */
+        showLoadingUI: true,
+        format: 0, /* SceneFormat.Splat */
+        splatAlphaRemovalThreshold: 10,
         onProgress: (_percent: number, label: string, loaderStatus: number) => {
           console.timeLog('addSplatScene', `${label} status=${loaderStatus}`);
           if (loaderStatus === 0) {
             setProgress(`Downloading... ${label}`);
-          } else {
-            setViewerState('processing');
-            setProgress(`Processing... ${label}`);
           }
         },
       });
       console.timeEnd('addSplatScene');
 
       if (cancelledRef.current) return;
-
       setViewerState('ready');
       console.log('Splat viewer ready');
 
-      const handleResize = () => {
-        if (cancelledRef.current || !container) return;
-        const w = container.clientWidth || 600;
-        const h = container.clientHeight || 400;
-        camera.aspect = w / h;
-        camera.updateProjectionMatrix();
-        renderer.setSize(w, h);
-      };
-      window.addEventListener('resize', handleResize);
-
     } catch (e: any) {
+      console.error('SplatViewer error:', e);
       if (!cancelledRef.current) {
         setError(e.message || 'Failed to load splat');
         setViewerState('error');
@@ -152,11 +118,12 @@ export default function SplatViewer({ status }: Props) {
 
   return (
     <Panel title="GAUSSIAN SPLAT" className="h-full flex flex-col">
-      <div className="relative flex-1 rounded-lg overflow-hidden bg-sentience-bg border border-sentience-border min-h-[300px]">
+      <div className="relative flex-1 rounded-lg overflow-hidden bg-sentience-bg border border-sentience-border min-h-[400px]">
+        {/* Library creates its own canvas + controls inside this div */}
         <div ref={canvasRef} className="absolute inset-0" />
 
         {viewerState !== 'ready' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
             {viewerState === 'idle' && !isDone && (
               <span className="text-sentience-muted text-sm">
                 Splat viewer will appear after training completes.
