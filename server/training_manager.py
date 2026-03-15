@@ -6,6 +6,7 @@ Extracted from gs_server.py with additions:
 - Iteration progress parsing from training backend output
 - Intermediate render image tracking
 - Elapsed time tracking
+- Run history: timestamped folders with symlink to current
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import time
 import traceback
 import zipfile
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import gs_pipeline
@@ -44,9 +46,13 @@ _MSPLAT_STEP_PATTERN = re.compile(r"step\s*=\s*(\d+)")
 
 class TrainingManager:
     LOG_RING_SIZE = 5000
+    MAX_RUNS = 10
 
     def __init__(self, work_dir: Path, iterations: int):
         self.work_dir = work_dir
+        self.runs_dir = work_dir / "runs"
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.current_link = work_dir / "current_run"
         self.iterations = iterations
         self.state = TrainingState.IDLE
         self.progress = 0.0
@@ -63,20 +69,66 @@ class TrainingManager:
         self._lock = threading.Lock()
         self._logs: deque[str] = deque(maxlen=self.LOG_RING_SIZE)
         self._log_counter = 0
+        self._run_name: str | None = None
 
+        self._migrate_legacy_run()
         self._restore_previous_run()
+
+    def _migrate_legacy_run(self):
+        """Migrate old flat current_run/ directory into runs/ with a symlink."""
+        if self.current_link.is_symlink():
+            return
+        if not self.current_link.is_dir():
+            return
+        # Old-style directory exists — move it into runs/
+        name = "migrated_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = self.runs_dir / name
+        print(f"Migrating legacy current_run/ → runs/{name}/")
+        shutil.move(str(self.current_link), str(dest))
+        self.current_link.symlink_to(dest)
 
     def _restore_previous_run(self):
         """If a previous run's output exists on disk, restore 'done' state."""
-        run_dir = self.work_dir / "current_run"
+        if not self.current_link.exists():
+            return
+        run_dir = self.current_link.resolve()
         ply = run_dir / "output" / "splat.ply"
         if ply.exists():
             self.state = TrainingState.DONE
             self.progress = 1.0
             self.output_ply = ply
             self.capture_dir = run_dir
-            self.message = f"Previous run restored: {ply.name}"
+            self._run_name = run_dir.name
+            self.message = f"Previous run restored: {run_dir.name}"
             self._log(f"Restored previous training output: {ply}")
+
+    def _create_run_dir(self) -> Path:
+        """Create a new timestamped run directory and update the current_run symlink."""
+        name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = self.runs_dir / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.current_link.is_symlink() or self.current_link.exists():
+            self.current_link.unlink()
+        self.current_link.symlink_to(run_dir)
+
+        self._run_name = name
+        self._cleanup_old_runs()
+        return run_dir
+
+    def _cleanup_old_runs(self):
+        """Remove oldest runs beyond MAX_RUNS."""
+        runs = sorted(
+            [d for d in self.runs_dir.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+        )
+        while len(runs) > self.MAX_RUNS:
+            oldest = runs.pop(0)
+            try:
+                shutil.rmtree(oldest)
+                self._log(f"Cleaned up old run: {oldest.name}")
+            except Exception as e:
+                self._log(f"Failed to clean up {oldest.name}: {e}")
 
     def start_training(self, zip_data: bytes) -> bool:
         with self._lock:
@@ -125,7 +177,53 @@ class TrainingManager:
                 "current_iteration": self.current_iteration,
                 "total_iterations": self.total_iterations,
                 "elapsed_seconds": round(elapsed, 1),
+                "run_name": self._run_name,
             }
+
+    def get_runs(self) -> list[dict]:
+        """Return metadata for all stored runs, newest first."""
+        runs = []
+        for d in sorted(self.runs_dir.iterdir(), key=lambda p: p.name, reverse=True):
+            if not d.is_dir():
+                continue
+            ply = d / "output" / "splat.ply"
+            has_ply = ply.exists()
+            size_mb = round(ply.stat().st_size / (1024 * 1024), 1) if has_ply else 0
+            is_current = (
+                self.current_link.is_symlink()
+                and self.current_link.resolve() == d.resolve()
+            )
+            runs.append({
+                "name": d.name,
+                "has_ply": has_ply,
+                "ply_size_mb": size_mb,
+                "is_current": is_current,
+            })
+        return runs
+
+    def switch_run(self, run_name: str) -> bool:
+        """Switch current_run symlink to a different historical run."""
+        target = self.runs_dir / run_name
+        if not target.is_dir():
+            return False
+        ply = target / "output" / "splat.ply"
+        if not ply.exists():
+            return False
+
+        if self.current_link.is_symlink() or self.current_link.exists():
+            self.current_link.unlink()
+        self.current_link.symlink_to(target)
+
+        with self._lock:
+            self.state = TrainingState.DONE
+            self.progress = 1.0
+            self.output_ply = ply
+            self.capture_dir = target
+            self._run_name = run_name
+            self.message = f"Switched to run: {run_name}"
+            self._elapsed_final = None
+            self.start_time = None
+        return True
 
     def _freeze_elapsed(self):
         """Snapshot elapsed time so it stops ticking. Must be called under _lock."""
@@ -197,10 +295,7 @@ class TrainingManager:
 
     def _run(self, zip_data: bytes):
         try:
-            capture_dir = self.work_dir / "current_run"
-            if capture_dir.exists():
-                shutil.rmtree(capture_dir)
-            capture_dir.mkdir(parents=True)
+            capture_dir = self._create_run_dir()
 
             with self._lock:
                 self.message = "Extracting ZIP..."

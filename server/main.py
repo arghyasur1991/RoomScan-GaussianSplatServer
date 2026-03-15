@@ -98,6 +98,20 @@ async def api_status():
     return manager.get_status()
 
 
+@app.get("/api/runs")
+async def api_runs():
+    return {"runs": manager.get_runs()}
+
+
+@app.post("/api/runs/{run_name}/activate")
+async def api_activate_run(run_name: str):
+    if manager.state == TrainingState.TRAINING:
+        return JSONResponse(status_code=409, content={"error": "Cannot switch while training"})
+    if manager.switch_run(run_name):
+        return {"status": "ok", "run_name": run_name}
+    return JSONResponse(status_code=404, content={"error": f"Run '{run_name}' not found or has no PLY"})
+
+
 @app.get("/api/keyframes")
 async def api_keyframes():
     if manager.capture_dir is None:

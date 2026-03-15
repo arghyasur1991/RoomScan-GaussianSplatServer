@@ -6,6 +6,7 @@ export interface TrainingStatus {
   current_iteration: number;
   total_iterations: number;
   elapsed_seconds: number;
+  run_name: string | null;
 }
 
 export interface Keyframe {

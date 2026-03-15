@@ -5,6 +5,7 @@ import KeyframeBrowser from './KeyframeBrowser';
 import PointCloudViewer from './PointCloudViewer';
 import SplatViewer from './SplatViewer';
 import LogPanel from './LogPanel';
+import RunHistory from './RunHistory';
 
 interface Props {
   status: TrainingStatus;
@@ -22,8 +23,11 @@ export default function Dashboard({ status }: Props) {
         <LogPanel />
       </div>
 
-      {/* Row 2: Keyframes */}
-      <div className="lg:col-span-3">
+      {/* Row 2: Run History | Keyframes */}
+      <div className="lg:col-span-1">
+        <RunHistory status={status} />
+      </div>
+      <div className="lg:col-span-2">
         <KeyframeBrowser status={status} />
       </div>
 

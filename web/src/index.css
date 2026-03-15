@@ -50,3 +50,6 @@ body {
   @apply bg-sentience-error/10 border-sentience-error/40 text-sentience-error
     hover:bg-sentience-error/20 hover:border-sentience-error;
 }
+.btn-sm {
+  @apply px-2 py-1 text-xs;
+}
