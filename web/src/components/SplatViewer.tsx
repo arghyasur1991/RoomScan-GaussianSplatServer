@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import type { TrainingStatus } from '../api';
 import { Panel } from './TrainingStatus';
@@ -7,134 +7,169 @@ interface Props {
   status: TrainingStatus;
 }
 
+type ViewerState = 'idle' | 'downloading' | 'processing' | 'ready' | 'error';
+
 export default function SplatViewer({ status }: Props) {
   const canvasRef = useRef<HTMLDivElement>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const [viewerState, setViewerState] = useState<ViewerState>('idle');
+  const [progress, setProgress] = useState('');
+  const [error, setError] = useState('');
   const viewerRef = useRef<any>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const controlsRef = useRef<any>(null);
   const frameRef = useRef<number>(0);
+  const cancelledRef = useRef(false);
 
   const isDone = status.state === 'done';
 
-  useEffect(() => {
-    if (!isDone || !canvasRef.current) return;
+  const cleanup = useCallback(() => {
+    cancelledRef.current = true;
+    cancelAnimationFrame(frameRef.current);
+    viewerRef.current?.dispose?.();
+    viewerRef.current = null;
+    rendererRef.current?.dispose();
+    rendererRef.current = null;
+    controlsRef.current?.dispose?.();
+    controlsRef.current = null;
+    if (canvasRef.current) canvasRef.current.innerHTML = '';
+  }, []);
 
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
+  const loadSplat = useCallback(async () => {
+    cleanup();
+    cancelledRef.current = false;
 
-    (async () => {
-      try {
-        const splatUrl = `/api/splat`;
+    if (!canvasRef.current) return;
 
-        const probe = await fetch(splatUrl, { method: 'HEAD' });
-        if (!probe.ok) {
-          throw new Error(`Splat not available (${probe.status})`);
-        }
-        if (cancelled) return;
+    setViewerState('downloading');
+    setProgress('Checking availability...');
+    setError('');
 
-        const { Viewer } = await import('@mkkellogg/gaussian-splats-3d');
-        if (cancelled || !canvasRef.current) return;
+    try {
+      const probe = await fetch('/api/splat', { method: 'HEAD' });
+      if (!probe.ok) throw new Error(`Splat not available (HTTP ${probe.status})`);
+      if (cancelledRef.current) return;
 
-        const container = canvasRef.current;
-        const width = container.clientWidth;
-        const height = container.clientHeight || 400;
+      const contentLength = probe.headers.get('content-length');
+      const sizeMB = contentLength ? (parseInt(contentLength) / 1048576).toFixed(0) : '?';
+      setProgress(`Downloading ${sizeMB} MB...`);
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(width, height);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        container.appendChild(renderer.domElement);
-        rendererRef.current = renderer;
+      const { Viewer } = await import('@mkkellogg/gaussian-splats-3d');
+      if (cancelledRef.current || !canvasRef.current) return;
 
-        const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 500);
-        camera.position.set(2, 2, 2);
+      const container = canvasRef.current;
+      const width = container.clientWidth || 600;
+      const height = container.clientHeight || 400;
 
-        const scene = new THREE.Scene();
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(width, height);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      container.appendChild(renderer.domElement);
+      rendererRef.current = renderer;
 
-        const { OrbitControls } = await import('three/examples/jsm/controls/OrbitControls.js');
-        const controls = new OrbitControls(camera, renderer.domElement);
-        controls.enableDamping = true;
-        controls.dampingFactor = 0.1;
-        controlsRef.current = controls;
+      const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 500);
+      camera.position.set(2, 2, 2);
 
-        const viewer = new Viewer({
-          scene,
-          renderer,
-          camera,
-          selfDrivenMode: false,
-        });
-        viewerRef.current = viewer;
+      const scene = new THREE.Scene();
 
-        await viewer.addSplatScene(splatUrl, { showLoadingUI: true, format: 2 /* SceneFormat.Ply */ });
+      const { OrbitControls } = await import('three/examples/jsm/controls/OrbitControls.js');
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.1;
+      controlsRef.current = controls;
 
-        if (cancelled) return;
+      const viewer = new Viewer({
+        scene,
+        renderer,
+        camera,
+        selfDrivenMode: false,
+      });
+      viewerRef.current = viewer;
 
-        const animate = () => {
-          if (cancelled) return;
-          frameRef.current = requestAnimationFrame(animate);
-          controls.update();
-          viewer.update();
-          viewer.render();
-        };
-        animate();
+      setProgress('Parsing gaussians...');
+      setViewerState('processing');
 
-        setLoaded(true);
-        setLoading(false);
+      await viewer.addSplatScene('/api/splat', {
+        showLoadingUI: false,
+        format: 2,
+      });
 
-        const handleResize = () => {
-          if (!container || cancelled) return;
-          const w = container.clientWidth;
-          const h = container.clientHeight || 400;
-          camera.aspect = w / h;
-          camera.updateProjectionMatrix();
-          renderer.setSize(w, h);
-        };
-        window.addEventListener('resize', handleResize);
+      if (cancelledRef.current) return;
 
-        return () => {
-          window.removeEventListener('resize', handleResize);
-        };
-      } catch (e: any) {
-        if (!cancelled) {
-          setError(e.message || 'Failed to load splat');
-          setLoading(false);
-        }
+      const animate = () => {
+        if (cancelledRef.current) return;
+        frameRef.current = requestAnimationFrame(animate);
+        controls.update();
+        viewer.update();
+        viewer.render();
+      };
+      animate();
+
+      setViewerState('ready');
+
+      const handleResize = () => {
+        if (cancelledRef.current || !container) return;
+        const w = container.clientWidth || 600;
+        const h = container.clientHeight || 400;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      };
+      window.addEventListener('resize', handleResize);
+
+    } catch (e: any) {
+      if (!cancelledRef.current) {
+        setError(e.message || 'Failed to load splat');
+        setViewerState('error');
       }
-    })();
+    }
+  }, [cleanup]);
 
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(frameRef.current);
-      viewerRef.current?.dispose?.();
-      rendererRef.current?.dispose();
-      controlsRef.current?.dispose?.();
-      if (canvasRef.current) canvasRef.current.innerHTML = '';
-      setLoaded(false);
-    };
-  }, [isDone]);
+  useEffect(() => {
+    if (isDone && viewerState === 'idle') {
+      loadSplat();
+    }
+    if (!isDone && viewerState !== 'idle') {
+      cleanup();
+      setViewerState('idle');
+    }
+  }, [isDone, viewerState, loadSplat, cleanup]);
 
-  const showOverlay = !loaded;
+  useEffect(() => {
+    return cleanup;
+  }, [cleanup]);
 
   return (
     <Panel title="GAUSSIAN SPLAT" className="h-full flex flex-col">
       <div className="relative flex-1 rounded-lg overflow-hidden bg-sentience-bg border border-sentience-border min-h-[300px]">
-        {/* Three.js canvas lives here -- React never touches children of this div */}
         <div ref={canvasRef} className="absolute inset-0" />
 
-        {!loaded && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            {!isDone && !loading && !error && (
+        {viewerState !== 'ready' && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
+            {viewerState === 'idle' && !isDone && (
               <span className="text-sentience-muted text-sm">
                 Splat viewer will appear after training completes.
               </span>
             )}
-            {error && (
-              <span className="text-sentience-error text-sm">
-                {error}
-              </span>
+
+            {(viewerState === 'downloading' || viewerState === 'processing') && (
+              <>
+                <div className="w-8 h-8 border-2 border-sentience-cyan border-t-transparent rounded-full animate-spin" />
+                <span className="text-sentience-cyan text-sm">{progress}</span>
+              </>
+            )}
+
+            {viewerState === 'error' && (
+              <>
+                <span className="text-sentience-error text-sm">{error}</span>
+                {isDone && (
+                  <button
+                    onClick={loadSplat}
+                    className="btn btn-primary text-xs mt-2"
+                  >
+                    Retry
+                  </button>
+                )}
+              </>
             )}
           </div>
         )}
