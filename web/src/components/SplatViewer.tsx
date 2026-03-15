@@ -85,13 +85,27 @@ export default function SplatViewer({ status }: Props) {
       });
       viewerRef.current = viewer;
 
-      setProgress('Parsing gaussians...');
       setViewerState('processing');
+      console.time('addSplatScene');
 
       await viewer.addSplatScene('/api/splat', {
         showLoadingUI: false,
-        format: 2,
+        format: 0, /* SceneFormat.Splat — compact 32-byte binary, much faster than PLY */
+        progressiveLoad: true,
+        onProgress: (percent: number, label: string, loaderStatus: number) => {
+          console.timeLog('addSplatScene', `${label} status=${loaderStatus}`);
+          if (loaderStatus === 0) {
+            setViewerState('downloading');
+            setProgress(`Downloading... ${label}`);
+          } else if (loaderStatus === 2) {
+            setViewerState('ready');
+          } else {
+            setViewerState('processing');
+            setProgress(`Processing splats... ${label}`);
+          }
+        },
       });
+      console.timeEnd('addSplatScene');
 
       if (cancelledRef.current) return;
 
