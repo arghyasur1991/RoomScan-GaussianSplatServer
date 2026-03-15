@@ -54,6 +54,7 @@ class TrainingManager:
         self.current_iteration = 0
         self.total_iterations = 0
         self.start_time: float | None = None
+        self._elapsed_final: float | None = None
         self._thread: threading.Thread | None = None
         self._cancel = threading.Event()
         self._lock = threading.Lock()
@@ -73,6 +74,7 @@ class TrainingManager:
             self.current_iteration = 0
             self.total_iterations = self.iterations
             self.start_time = time.time()
+            self._elapsed_final = None
             self._logs.clear()
             self._log_counter = 0
 
@@ -87,13 +89,17 @@ class TrainingManager:
                 self.state = TrainingState.IDLE
                 self.message = "Cancelled"
                 self.progress = 0.0
+                self._elapsed_final = None
                 self.start_time = None
 
     def get_status(self) -> dict:
         with self._lock:
-            elapsed = 0.0
-            if self.start_time is not None:
+            if self._elapsed_final is not None:
+                elapsed = self._elapsed_final
+            elif self.start_time is not None:
                 elapsed = time.time() - self.start_time
+            else:
+                elapsed = 0.0
             return {
                 "state": self.state,
                 "progress": round(self.progress, 3),
@@ -103,6 +109,11 @@ class TrainingManager:
                 "total_iterations": self.total_iterations,
                 "elapsed_seconds": round(elapsed, 1),
             }
+
+    def _freeze_elapsed(self):
+        """Snapshot elapsed time so it stops ticking. Must be called under _lock."""
+        if self.start_time is not None:
+            self._elapsed_final = time.time() - self.start_time
 
     def get_logs(self, since_line: int = 0) -> tuple[list[str], int]:
         """Return (lines, next_line_number) for lines after since_line."""
@@ -215,6 +226,7 @@ class TrainingManager:
 
             if trained_ply and trained_ply.exists():
                 with self._lock:
+                    self._freeze_elapsed()
                     self.state = TrainingState.DONE
                     self.progress = 1.0
                     self.message = f"Training complete: {trained_ply.name}"
@@ -222,6 +234,7 @@ class TrainingManager:
                 self._log(f"Training complete! Output: {trained_ply.name}")
             else:
                 with self._lock:
+                    self._freeze_elapsed()
                     self.state = TrainingState.ERROR
                     self.message = "Training finished but no PLY output found"
                 self._log("ERROR: No PLY output found after training")
@@ -229,6 +242,7 @@ class TrainingManager:
         except Exception as e:
             traceback.print_exc()
             with self._lock:
+                self._freeze_elapsed()
                 self.state = TrainingState.ERROR
                 self.message = str(e)
             self._log(f"ERROR: {e}")
