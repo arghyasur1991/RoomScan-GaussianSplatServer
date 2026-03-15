@@ -85,30 +85,7 @@ export default function SplatViewer({ status }: Props) {
       });
       viewerRef.current = viewer;
 
-      setViewerState('processing');
-      console.time('addSplatScene');
-
-      await viewer.addSplatScene('/api/splat', {
-        showLoadingUI: false,
-        format: 0, /* SceneFormat.Splat — compact 32-byte binary, much faster than PLY */
-        progressiveLoad: true,
-        onProgress: (percent: number, label: string, loaderStatus: number) => {
-          console.timeLog('addSplatScene', `${label} status=${loaderStatus}`);
-          if (loaderStatus === 0) {
-            setViewerState('downloading');
-            setProgress(`Downloading... ${label}`);
-          } else if (loaderStatus === 2) {
-            setViewerState('ready');
-          } else {
-            setViewerState('processing');
-            setProgress(`Processing splats... ${label}`);
-          }
-        },
-      });
-      console.timeEnd('addSplatScene');
-
-      if (cancelledRef.current) return;
-
+      // Start render loop immediately so progressive splats are visible
       const animate = () => {
         if (cancelledRef.current) return;
         frameRef.current = requestAnimationFrame(animate);
@@ -118,7 +95,28 @@ export default function SplatViewer({ status }: Props) {
       };
       animate();
 
+      setViewerState('downloading');
+      console.time('addSplatScene');
+
+      await viewer.addSplatScene('/api/splat', {
+        showLoadingUI: false,
+        format: 0, /* SceneFormat.Splat — compact 32-byte binary */
+        onProgress: (_percent: number, label: string, loaderStatus: number) => {
+          console.timeLog('addSplatScene', `${label} status=${loaderStatus}`);
+          if (loaderStatus === 0) {
+            setProgress(`Downloading... ${label}`);
+          } else {
+            setViewerState('processing');
+            setProgress(`Processing... ${label}`);
+          }
+        },
+      });
+      console.timeEnd('addSplatScene');
+
+      if (cancelledRef.current) return;
+
       setViewerState('ready');
+      console.log('Splat viewer ready');
 
       const handleResize = () => {
         if (cancelledRef.current || !container) return;
