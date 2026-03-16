@@ -283,6 +283,108 @@ class TrainingManager:
         self._log(f"Cleared all runs ({count} deleted)")
         return count
 
+    def retrain_run(self, run_name: str, iterations_override: int | None = None) -> bool:
+        """Re-run training on an existing run's capture data (skips upload/extract)."""
+        with self._lock:
+            if self.state == TrainingState.TRAINING:
+                return False
+
+        target = self.runs_dir / run_name
+        if not target.is_dir():
+            return False
+        if not (target / "frames.jsonl").exists():
+            return False
+
+        with self._lock:
+            self._cancel.clear()
+            self.state = TrainingState.TRAINING
+            self.progress = 0.0
+            self.message = "Retraining..."
+            self.output_ply = None
+            self.backend_name = None
+            self.current_iteration = 0
+            self._run_iterations = iterations_override or self.iterations
+            self.total_iterations = self._run_iterations
+            self.start_time = time.time()
+            self._elapsed_final = None
+            self._logs.clear()
+            self._log_counter = 0
+            self.capture_dir = target
+            self._run_name = run_name
+
+        if self.current_link.is_symlink() or self.current_link.exists():
+            self.current_link.unlink()
+        self.current_link.symlink_to(target)
+
+        self._thread = threading.Thread(
+            target=self._run_retrain, args=(target,), daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def _run_retrain(self, capture_dir: Path):
+        """Training thread for retrain — skips ZIP extraction, re-uses capture data."""
+        try:
+            # Clean previous output so we get a fresh train
+            output_dir = capture_dir / "output"
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+                self._log("Cleared previous output directory")
+
+            with self._lock:
+                self.message = "Converting to COLMAP format..."
+                self.progress = 0.1
+            self._log("Converting to COLMAP format...")
+
+            frames = gs_pipeline.parse_frames(capture_dir)
+            gs_pipeline.convert_to_colmap(capture_dir, frames)
+            self._log(f"COLMAP conversion done: {len(frames)} frames")
+
+            if self._cancel.is_set():
+                return
+
+            backend = self._detect_backend()
+            iters = self._run_iterations
+            with self._lock:
+                self.backend_name = backend
+                self.message = f"Retraining ({iters} iters, {backend})..."
+                self.progress = 0.2
+            self._log(f"Starting retrain: backend={backend}, iterations={iters}")
+
+            args = argparse.Namespace(iterations=iters, gs_repo=None)
+            output_dir = gs_pipeline.train(capture_dir, args, log_fn=self._log)
+
+            if self._cancel.is_set():
+                return
+
+            trained_ply = output_dir / "splat.ply"
+            if not trained_ply.exists():
+                candidates = list(output_dir.rglob("*.ply"))
+                trained_ply = candidates[0] if candidates else None
+
+            if trained_ply and trained_ply.exists():
+                with self._lock:
+                    self._freeze_elapsed()
+                    self.state = TrainingState.DONE
+                    self.progress = 1.0
+                    self.message = f"Retrain complete: {trained_ply.name}"
+                    self.output_ply = trained_ply
+                self._log(f"Retrain complete! Output: {trained_ply.name}")
+            else:
+                with self._lock:
+                    self._freeze_elapsed()
+                    self.state = TrainingState.ERROR
+                    self.message = "Retrain finished but no PLY output found"
+                self._log("ERROR: No PLY output found after retrain")
+
+        except Exception as e:
+            traceback.print_exc()
+            with self._lock:
+                self._freeze_elapsed()
+                self.state = TrainingState.ERROR
+                self.message = str(e)
+            self._log(f"ERROR: {e}")
+
     def _freeze_elapsed(self):
         """Snapshot elapsed time so it stops ticking. Must be called under _lock."""
         if self.start_time is not None:

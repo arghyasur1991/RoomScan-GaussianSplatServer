@@ -113,6 +113,16 @@ async def api_activate_run(run_name: str):
     return JSONResponse(status_code=404, content={"error": f"Run '{run_name}' not found or has no PLY"})
 
 
+@app.post("/api/runs/{run_name}/retrain")
+async def api_retrain_run(run_name: str, iterations: int | None = None):
+    if manager.state == TrainingState.TRAINING:
+        return JSONResponse(status_code=409, content={"error": "Training already in progress"})
+    iters = iterations if iterations and iterations > 0 else None
+    if manager.retrain_run(run_name, iterations_override=iters):
+        return {"status": "started", "run_name": run_name, "iterations": iters or manager.iterations}
+    return JSONResponse(status_code=404, content={"error": f"Run '{run_name}' not found or missing capture data"})
+
+
 @app.delete("/api/runs/{run_name}")
 async def api_delete_run(run_name: str):
     if manager.state == TrainingState.TRAINING:

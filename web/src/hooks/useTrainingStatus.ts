@@ -9,6 +9,7 @@ const INITIAL_STATUS: TrainingStatus = {
   current_iteration: 0,
   total_iterations: 0,
   elapsed_seconds: 0,
+  run_name: null,
 };
 
 const MIN_RETRY_MS = 1000;

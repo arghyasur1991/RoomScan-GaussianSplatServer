@@ -17,10 +17,11 @@ export default function RunHistory({ status }: Props) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [switching, setSwitching] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [retraining, setRetraining] = useState<string | null>(null);
   const [clearingAll, setClearingAll] = useState(false);
 
   const isTraining = status.state === 'training';
-  const busy = switching !== null || deleting !== null || clearingAll;
+  const busy = switching !== null || deleting !== null || retraining !== null || clearingAll;
 
   const fetchRuns = useCallback(() => {
     fetch('/api/runs')
@@ -51,6 +52,17 @@ export default function RunHistory({ status }: Props) {
       fetchRuns();
     } catch { /* ignore */ } finally {
       setDeleting(null);
+    }
+  }, [fetchRuns]);
+
+  const retrain = useCallback(async (name: string) => {
+    if (!confirm(`Retrain run "${name}"? This will replace its current output.`)) return;
+    setRetraining(name);
+    try {
+      await fetch(`/api/runs/${name}/retrain`, { method: 'POST' });
+      fetchRuns();
+    } catch { /* ignore */ } finally {
+      setRetraining(null);
     }
   }, [fetchRuns]);
 
@@ -103,6 +115,14 @@ export default function RunHistory({ status }: Props) {
               ) : (
                 <span className="text-sentience-muted">No PLY</span>
               )}
+              <button
+                onClick={() => retrain(run.name)}
+                disabled={busy || isTraining}
+                className="btn btn-sm !bg-amber-900/40 !border-amber-700/50 hover:!bg-amber-800/60 !text-amber-300"
+                title={`Retrain ${run.name}`}
+              >
+                {retraining === run.name ? '...' : '⟳'}
+              </button>
               <button
                 onClick={() => deleteRun(run.name)}
                 disabled={busy || isTraining}
