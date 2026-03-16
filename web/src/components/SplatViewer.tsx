@@ -19,6 +19,8 @@ export default function SplatViewer({ status }: Props) {
   const controlsRef = useRef<any>(null);
   const frameRef = useRef<number>(0);
   const cancelledRef = useRef(false);
+  const runNameRef = useRef(status.run_name);
+  runNameRef.current = status.run_name;
 
   const isDone = status.state === 'done';
 
@@ -45,7 +47,8 @@ export default function SplatViewer({ status }: Props) {
     setError('');
 
     try {
-      const probe = await fetch('/api/splat', { method: 'HEAD' });
+      const cacheBust = `run=${runNameRef.current ?? ''}&t=${Date.now()}`;
+      const probe = await fetch(`/api/splat?${cacheBust}`, { method: 'HEAD' });
       if (!probe.ok) throw new Error(`Splat not available (HTTP ${probe.status})`);
       if (cancelledRef.current) return;
 
@@ -100,7 +103,7 @@ export default function SplatViewer({ status }: Props) {
       setProgress('Downloading splat...');
       console.time('addSplatScene');
 
-      await viewer.addSplatScene('/api/splat', {
+      await viewer.addSplatScene(`/api/splat?${cacheBust}`, {
         showLoadingUI: false,
         format: 2, /* SceneFormat.Ply — full PLY with all gaussians */
         splatAlphaRemovalThreshold: 5,

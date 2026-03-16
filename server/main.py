@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from training_manager import TrainingManager, TrainingState
@@ -36,6 +37,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class NoCacheAPIMiddleware(BaseHTTPMiddleware):
+    """Prevent browser caching on /api/ data endpoints so run-switching works."""
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
+app.add_middleware(NoCacheAPIMiddleware)
 
 
 # ═══════════════════════════════════════════════════════════════════════

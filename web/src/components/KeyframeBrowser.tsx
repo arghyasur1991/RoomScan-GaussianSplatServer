@@ -31,7 +31,7 @@ export default function KeyframeBrowser({ status }: Props) {
               className="aspect-[4/3] rounded-lg overflow-hidden border border-sentience-border hover:border-sentience-cyan transition-colors cursor-pointer bg-sentience-bg"
             >
               <img
-                src={kf.image_url}
+                src={`${kf.image_url}?run=${status.run_name ?? ''}`}
                 alt={`Frame ${kf.id}`}
                 loading="lazy"
                 className="w-full h-full object-cover"

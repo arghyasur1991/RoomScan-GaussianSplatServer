@@ -53,7 +53,7 @@ function PointCloudScene({ pointSize }: { pointSize: number }) {
 
   useEffect(() => {
     const loader = new PLYLoader();
-    loader.load('/api/pointcloud', (geo) => {
+    loader.load(`/api/pointcloud?t=${Date.now()}`, (geo) => {
       geo.computeBoundingBox();
       const box = geo.boundingBox!;
       const center = new THREE.Vector3();
