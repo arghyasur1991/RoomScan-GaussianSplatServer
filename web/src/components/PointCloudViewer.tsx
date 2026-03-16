@@ -13,6 +13,7 @@ interface Props {
 export default function PointCloudViewer({ status }: Props) {
   const [pointSize, setPointSize] = useState(2.0);
   const hasData = status.state !== 'idle';
+  const runName = status.run_name;
 
   return (
     <Panel title="POINT CLOUD" className="h-full flex flex-col">
@@ -31,7 +32,7 @@ export default function PointCloudViewer({ status }: Props) {
       </div>
       <div className="flex-1 rounded-lg overflow-hidden bg-sentience-bg border border-sentience-border min-h-[300px]">
         {hasData ? (
-          <Canvas camera={{ position: [2, 2, 2], fov: 60 }}>
+          <Canvas key={runName ?? 'default'} camera={{ position: [2, 2, 2], fov: 60 }}>
             <ambientLight intensity={0.5} />
             <PointCloudScene pointSize={pointSize} />
             <OrbitControls makeDefault enableDamping dampingFactor={0.1} />

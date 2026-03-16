@@ -134,6 +134,16 @@ export default function SplatViewer({ status }: Props) {
     }
   }, [cleanup]);
 
+  const runName = status.run_name;
+
+  useEffect(() => {
+    if (isDone) {
+      cleanup();
+      setViewerState('idle');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runName]);
+
   useEffect(() => {
     if (isDone && viewerState === 'idle') {
       loadSplat();

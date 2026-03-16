@@ -14,7 +14,7 @@ export default function KeyframeBrowser({ status }: Props) {
   useEffect(() => {
     if (status.state === 'idle') return;
     fetchKeyframes().then((res) => setKeyframes(res.keyframes)).catch(() => {});
-  }, [status.state]);
+  }, [status.state, status.run_name]);
 
   const close = useCallback(() => setSelected(null), []);
 
