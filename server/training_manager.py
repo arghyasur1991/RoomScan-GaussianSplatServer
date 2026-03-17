@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import re
 import shutil
 import threading
@@ -43,6 +44,21 @@ _ITER_PATTERNS = [
 # msplat outputs "step=  100  splats= 35,071  ms=4.9" — no total in the line
 _MSPLAT_STEP_PATTERN = re.compile(r"step\s*=\s*(\d+)")
 
+# msplat step metrics: "step=  100  splats= 35,071  ms=4.9"
+_MSPLAT_METRICS_PATTERN = re.compile(
+    r"step\s*=\s*(\d+)\s+splats\s*=\s*([\d,]+)\s+ms\s*=\s*([\d.]+)"
+)
+
+# msplat per-view eval: "  [1/24] IMG_001.jpg  PSNR=28.5  SSIM=0.89  L1=0.03"
+_EVAL_VIEW_PATTERN = re.compile(
+    r"\[(\d+)/(\d+)\]\s+(\S+)\s+PSNR=([\d.]+)\s+SSIM=([\d.]+)\s+L1=([\d.]+)"
+)
+
+# msplat final eval summary: "  PSNR:  27.14  SSIM:  0.853  L1:  0.021  Gaussians: 3510000"
+_EVAL_SUMMARY_PATTERN = re.compile(
+    r"PSNR:\s+([\d.]+)\s+SSIM:\s+([\d.]+)\s+L1:\s+([\d.]+)\s+Gaussians:\s+([\d,]+)"
+)
+
 
 class TrainingManager:
     LOG_RING_SIZE = 5000
@@ -70,6 +86,13 @@ class TrainingManager:
         self._logs: deque[str] = deque(maxlen=self.LOG_RING_SIZE)
         self._log_counter = 0
         self._run_name: str | None = None
+        # --- Metrics tracking ---
+        self._step_metrics: list[dict] = []   # [{step, splats, ms_per_iter, loss}]
+        self.eval_psnr: float | None = None
+        self.eval_ssim: float | None = None
+        self.eval_l1: float | None = None
+        self.gaussian_count: int | None = None
+        self._eval_per_view: list[dict] = []  # [{name, psnr, ssim, l1}]
 
         self._migrate_legacy_run()
         self._restore_previous_run()
@@ -147,6 +170,12 @@ class TrainingManager:
             self._elapsed_final = None
             self._logs.clear()
             self._log_counter = 0
+            self._step_metrics = []
+            self.eval_psnr = None
+            self.eval_ssim = None
+            self.eval_l1 = None
+            self.gaussian_count = None
+            self._eval_per_view = []
 
         self._thread = threading.Thread(target=self._run, args=(zip_data,), daemon=True)
         self._thread.start()
@@ -179,6 +208,10 @@ class TrainingManager:
                 "total_iterations": self.total_iterations,
                 "elapsed_seconds": round(elapsed, 1),
                 "run_name": self._run_name,
+                "eval_psnr": self.eval_psnr,
+                "eval_ssim": self.eval_ssim,
+                "eval_l1": self.eval_l1,
+                "gaussian_count": self.gaussian_count,
             }
 
     def get_runs(self) -> list[dict]:
@@ -194,11 +227,25 @@ class TrainingManager:
                 self.current_link.is_symlink()
                 and self.current_link.resolve() == d.resolve()
             )
+            metrics_file = d / "output" / "metrics.json"
+            run_metrics = {}
+            if metrics_file.exists():
+                try:
+                    run_metrics = json.loads(metrics_file.read_text())
+                except Exception:
+                    pass
             runs.append({
                 "name": d.name,
                 "has_ply": has_ply,
                 "ply_size_mb": size_mb,
                 "is_current": is_current,
+                "eval_psnr": run_metrics.get("eval_psnr"),
+                "eval_ssim": run_metrics.get("eval_ssim"),
+                "eval_l1": run_metrics.get("eval_l1"),
+                "gaussian_count": run_metrics.get("gaussian_count"),
+                "elapsed_seconds": run_metrics.get("elapsed_seconds"),
+                "iterations": run_metrics.get("iterations"),
+                "backend": run_metrics.get("backend"),
             })
         return runs
 
@@ -309,6 +356,12 @@ class TrainingManager:
             self._elapsed_final = None
             self._logs.clear()
             self._log_counter = 0
+            self._step_metrics = []
+            self.eval_psnr = None
+            self.eval_ssim = None
+            self.eval_l1 = None
+            self.gaussian_count = None
+            self._eval_per_view = []
             self.capture_dir = target
             self._run_name = run_name
 
@@ -370,6 +423,7 @@ class TrainingManager:
                     self.message = f"Retrain complete: {trained_ply.name}"
                     self.output_ply = trained_ply
                 self._log(f"Retrain complete! Output: {trained_ply.name}")
+                self._save_run_metrics()
             else:
                 with self._lock:
                     self._freeze_elapsed()
@@ -425,6 +479,53 @@ class TrainingManager:
             return path
         return None
 
+    def get_metrics(self) -> dict:
+        """Return training metrics time-series and eval results."""
+        with self._lock:
+            result = {"steps": list(self._step_metrics)}
+            if self.eval_psnr is not None:
+                result["eval"] = {
+                    "psnr": self.eval_psnr,
+                    "ssim": self.eval_ssim,
+                    "l1": self.eval_l1,
+                    "gaussian_count": self.gaussian_count,
+                    "per_view": list(self._eval_per_view),
+                }
+            return result
+
+    def get_checkpoints(self) -> list[dict]:
+        """Return list of intermediate checkpoint PLY files for the current run."""
+        if self.capture_dir is None:
+            return []
+        output_dir = self.capture_dir / "output"
+        if not output_dir.exists():
+            return []
+        checkpoints = []
+        for f in sorted(output_dir.glob("splat*.ply")):
+            name = f.stem  # e.g. "splat_1400" or "splat"
+            step_match = re.search(r"_(\d+)$", name)
+            step = int(step_match.group(1)) if step_match else self.total_iterations
+            size_mb = round(f.stat().st_size / (1024 * 1024), 1)
+            checkpoints.append({
+                "step": step,
+                "filename": f.name,
+                "size_mb": size_mb,
+            })
+        checkpoints.sort(key=lambda c: c["step"])
+        return checkpoints
+
+    def get_checkpoint_path(self, filename: str) -> Path | None:
+        """Return path to a specific checkpoint PLY, or None if not found."""
+        if self.capture_dir is None:
+            return None
+        path = (self.capture_dir / "output" / filename).resolve()
+        output_dir = (self.capture_dir / "output").resolve()
+        if not str(path).startswith(str(output_dir)):
+            return None
+        if path.exists() and path.is_file() and path.suffix.lower() == ".ply":
+            return path
+        return None
+
     def _log(self, line: str):
         with self._lock:
             self._logs.append(line)
@@ -444,6 +545,21 @@ class TrainingManager:
                     self.message = f"Training... {current}/{total}"
                 return
 
+        m = _MSPLAT_METRICS_PATTERN.search(line)
+        if m:
+            step = int(m.group(1))
+            splats = int(m.group(2).replace(",", ""))
+            ms = float(m.group(3))
+            with self._lock:
+                self.current_iteration = step
+                total = self.total_iterations or self.iterations
+                self.progress = 0.2 + 0.8 * (step / max(total, 1))
+                self.message = f"Training... {step}/{total}"
+                self._step_metrics.append({
+                    "step": step, "splats": splats, "ms_per_iter": ms,
+                })
+            return
+
         m = _MSPLAT_STEP_PATTERN.search(line)
         if m:
             current = int(m.group(1))
@@ -452,6 +568,26 @@ class TrainingManager:
                 total = self.total_iterations or self.iterations
                 self.progress = 0.2 + 0.8 * (current / max(total, 1))
                 self.message = f"Training... {current}/{total}"
+            return
+
+        m = _EVAL_VIEW_PATTERN.search(line)
+        if m:
+            with self._lock:
+                self._eval_per_view.append({
+                    "name": m.group(3),
+                    "psnr": float(m.group(4)),
+                    "ssim": float(m.group(5)),
+                    "l1": float(m.group(6)),
+                })
+            return
+
+        m = _EVAL_SUMMARY_PATTERN.search(line)
+        if m:
+            with self._lock:
+                self.eval_psnr = float(m.group(1))
+                self.eval_ssim = float(m.group(2))
+                self.eval_l1 = float(m.group(3))
+                self.gaussian_count = int(m.group(4).replace(",", ""))
 
     def _run(self, zip_data: bytes):
         try:
@@ -514,6 +650,7 @@ class TrainingManager:
                     self.message = f"Training complete: {trained_ply.name}"
                     self.output_ply = trained_ply
                 self._log(f"Training complete! Output: {trained_ply.name}")
+                self._save_run_metrics()
             else:
                 with self._lock:
                     self._freeze_elapsed()
@@ -528,6 +665,30 @@ class TrainingManager:
                 self.state = TrainingState.ERROR
                 self.message = str(e)
             self._log(f"ERROR: {e}")
+
+    def _save_run_metrics(self):
+        """Persist eval metrics to metrics.json in the current run's output dir."""
+        if self.capture_dir is None:
+            return
+        output_dir = self.capture_dir / "output"
+        if not output_dir.exists():
+            return
+        metrics = {}
+        with self._lock:
+            if self.eval_psnr is not None:
+                metrics["eval_psnr"] = self.eval_psnr
+                metrics["eval_ssim"] = self.eval_ssim
+                metrics["eval_l1"] = self.eval_l1
+                metrics["gaussian_count"] = self.gaussian_count
+            if self._elapsed_final is not None:
+                metrics["elapsed_seconds"] = round(self._elapsed_final, 1)
+            metrics["iterations"] = self._run_iterations
+            metrics["backend"] = self.backend_name
+        if metrics:
+            try:
+                (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+            except Exception:
+                pass
 
     @staticmethod
     def _detect_backend() -> str:

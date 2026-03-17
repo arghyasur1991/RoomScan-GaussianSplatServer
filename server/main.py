@@ -224,6 +224,29 @@ async def api_render_image(filename: str):
     return FileResponse(path=path, media_type=media)
 
 
+@app.get("/api/metrics")
+async def api_metrics():
+    return manager.get_metrics()
+
+
+@app.get("/api/checkpoints")
+async def api_checkpoints():
+    checkpoints = manager.get_checkpoints()
+    return {"checkpoints": checkpoints, "count": len(checkpoints)}
+
+
+@app.get("/api/checkpoints/{filename}")
+async def api_checkpoint_file(filename: str):
+    path = manager.get_checkpoint_path(filename)
+    if path is None:
+        return JSONResponse(status_code=404, content={"error": "Checkpoint not found"})
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 @app.api_route("/api/splat", methods=["GET", "HEAD"])
 async def api_splat():
