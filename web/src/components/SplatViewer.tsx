@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import type { TrainingStatus } from '../api';
+import type { TrainingStatus, Checkpoint } from '../api';
+import { fetchCheckpoints } from '../api';
 import { Panel } from './TrainingStatus';
 
 interface Props {
@@ -22,7 +23,38 @@ export default function SplatViewer({ status }: Props) {
   const runNameRef = useRef(status.run_name);
   runNameRef.current = status.run_name;
 
+  const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const [selectedCp, setSelectedCp] = useState<number | null>(null);
+  const [autoPlay, setAutoPlay] = useState(false);
+
   const isDone = status.state === 'done';
+  const isTraining = status.state === 'training';
+
+  useEffect(() => {
+    if (!isDone && !isTraining) { setCheckpoints([]); return; }
+    const load = () => {
+      fetchCheckpoints()
+        .then((data) => setCheckpoints(data.checkpoints ?? []))
+        .catch(() => {});
+    };
+    load();
+    if (isTraining) {
+      const id = setInterval(load, 30000);
+      return () => clearInterval(id);
+    }
+  }, [isDone, isTraining, status.run_name]);
+
+  useEffect(() => {
+    if (!autoPlay || checkpoints.length < 2) return;
+    const id = setInterval(() => {
+      setSelectedCp((prev) => {
+        const idx = prev == null ? 0 : checkpoints.findIndex((c) => c.step === prev);
+        const next = (idx + 1) % checkpoints.length;
+        return checkpoints[next].step;
+      });
+    }, 3000);
+    return () => clearInterval(id);
+  }, [autoPlay, checkpoints]);
 
   const cleanup = useCallback(() => {
     cancelledRef.current = true;
@@ -36,7 +68,7 @@ export default function SplatViewer({ status }: Props) {
     if (canvasRef.current) canvasRef.current.innerHTML = '';
   }, []);
 
-  const loadSplat = useCallback(async () => {
+  const loadSplat = useCallback(async (url?: string) => {
     cleanup();
     cancelledRef.current = false;
 
@@ -47,8 +79,8 @@ export default function SplatViewer({ status }: Props) {
     setError('');
 
     try {
-      const cacheBust = `run=${runNameRef.current ?? ''}&t=${Date.now()}`;
-      const probe = await fetch(`/api/splat?${cacheBust}`, { method: 'HEAD' });
+      const splatUrl = url ?? `/api/splat?run=${runNameRef.current ?? ''}&t=${Date.now()}`;
+      const probe = await fetch(splatUrl, { method: 'HEAD' });
       if (!probe.ok) throw new Error(`Splat not available (HTTP ${probe.status})`);
       if (cancelledRef.current) return;
 
@@ -59,7 +91,6 @@ export default function SplatViewer({ status }: Props) {
       const container = canvasRef.current;
       const width = container.clientWidth || 600;
       const height = container.clientHeight || 400;
-      console.log(`SplatViewer container: ${width}x${height}`);
 
       const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
       renderer.setSize(width, height);
@@ -78,10 +109,27 @@ export default function SplatViewer({ status }: Props) {
       const controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
       controls.dampingFactor = 0.1;
+      controls.enablePan = true;
+      controls.panSpeed = 1.0;
+      controls.enableZoom = true;
+      controls.zoomSpeed = 1.2;
+      controls.minDistance = 0.1;
+      controls.maxDistance = 50;
       controls.target.set(0, 0, 0);
+      controls.screenSpacePanning = true;
       controlsRef.current = controls;
 
-      // Start render loop immediately
+      const defaultCamPos = new THREE.Vector3(0, 0, 3);
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === 'r' || e.key === 'R') {
+          camera.position.copy(defaultCamPos);
+          controls.target.set(0, 0, 0);
+          controls.update();
+        }
+      };
+      renderer.domElement.tabIndex = 0;
+      renderer.domElement.addEventListener('keydown', handleKeyDown);
+
       const animate = () => {
         if (cancelledRef.current) return;
         frameRef.current = requestAnimationFrame(animate);
@@ -101,22 +149,19 @@ export default function SplatViewer({ status }: Props) {
       animate();
 
       setProgress('Downloading splat...');
-      console.time('addSplatScene');
 
-      await viewer.addSplatScene(`/api/splat?${cacheBust}`, {
+      await viewer.addSplatScene(splatUrl, {
         showLoadingUI: false,
-        format: 2, /* SceneFormat.Ply — full PLY with all gaussians */
+        format: 2,
         splatAlphaRemovalThreshold: 5,
-        onProgress: (_p: number, label: string, status: number) => {
-          if (status === 0) setProgress(`Downloading... ${label}`);
+        onProgress: (_p: number, label: string, pStatus: number) => {
+          if (pStatus === 0) setProgress(`Downloading... ${label}`);
           else setProgress('Processing...');
         },
       });
-      console.timeEnd('addSplatScene');
 
       if (cancelledRef.current) return;
       setViewerState('ready');
-      console.log('Splat viewer ready');
 
       const handleResize = () => {
         if (cancelledRef.current || !container) return;
@@ -137,12 +182,21 @@ export default function SplatViewer({ status }: Props) {
     }
   }, [cleanup]);
 
+  const loadCheckpoint = useCallback((step: number) => {
+    const cp = checkpoints.find((c) => c.step === step);
+    if (!cp) return;
+    setSelectedCp(step);
+    const url = `/api/checkpoints/${encodeURIComponent(cp.filename)}?t=${Date.now()}`;
+    loadSplat(url);
+  }, [checkpoints, loadSplat]);
+
   const runName = status.run_name;
 
   useEffect(() => {
     if (isDone) {
       cleanup();
       setViewerState('idle');
+      setSelectedCp(null);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runName]);
@@ -151,11 +205,11 @@ export default function SplatViewer({ status }: Props) {
     if (isDone && viewerState === 'idle') {
       loadSplat();
     }
-    if (!isDone && viewerState !== 'idle') {
+    if (!isDone && !isTraining && viewerState !== 'idle') {
       cleanup();
       setViewerState('idle');
     }
-  }, [isDone, viewerState, loadSplat, cleanup]);
+  }, [isDone, isTraining, viewerState, loadSplat, cleanup]);
 
   useEffect(() => {
     return cleanup;
@@ -185,7 +239,7 @@ export default function SplatViewer({ status }: Props) {
               <div className="pointer-events-auto flex flex-col items-center gap-2">
                 <span className="text-sentience-error text-sm">{error}</span>
                 {isDone && (
-                  <button onClick={loadSplat} className="btn btn-primary text-xs">
+                  <button onClick={() => loadSplat()} className="btn btn-primary text-xs">
                     Retry
                   </button>
                 )}
@@ -194,6 +248,40 @@ export default function SplatViewer({ status }: Props) {
           </div>
         )}
       </div>
+
+      {checkpoints.length > 1 && (
+        <div className="mt-3 px-1">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-[10px] text-sentience-muted uppercase tracking-wider">Checkpoints</span>
+            <button
+              onClick={() => setAutoPlay(!autoPlay)}
+              className={`text-[10px] px-2 py-0.5 rounded border ${
+                autoPlay
+                  ? 'border-sentience-cyan bg-sentience-cyan/10 text-sentience-cyan'
+                  : 'border-sentience-border text-sentience-muted hover:border-sentience-cyan/50'
+              }`}
+            >
+              {autoPlay ? '⏸ Pause' : '▶ Auto-play'}
+            </button>
+          </div>
+          <div className="flex items-center gap-1">
+            {checkpoints.map((cp) => (
+              <button
+                key={cp.step}
+                onClick={() => loadCheckpoint(cp.step)}
+                className={`flex-1 text-[9px] py-1 rounded border transition-colors ${
+                  selectedCp === cp.step
+                    ? 'border-sentience-cyan bg-sentience-cyan/10 text-sentience-cyan'
+                    : 'border-sentience-border text-sentience-muted hover:border-sentience-cyan/50 hover:text-sentience-text'
+                }`}
+                title={`${cp.size_mb} MB`}
+              >
+                {cp.step >= 1000 ? `${(cp.step / 1000).toFixed(1)}k` : cp.step}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </Panel>
   );
 }

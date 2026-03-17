@@ -6,6 +6,10 @@ import PointCloudViewer from './PointCloudViewer';
 import SplatViewer from './SplatViewer';
 import LogPanel from './LogPanel';
 import RunHistory from './RunHistory';
+import TrainingMetricsChart from './TrainingMetricsChart';
+import EvalResultsPanel from './EvalResultsPanel';
+import BenchmarkComparison from './BenchmarkComparison';
+import RenderGallery from './RenderGallery';
 
 interface Props {
   status: TrainingStatus;
@@ -23,7 +27,25 @@ export default function Dashboard({ status }: Props) {
         <LogPanel />
       </div>
 
-      {/* Row 2: Run History | Keyframes */}
+      {/* Row 2: Training Metrics (full width, auto-hides when empty) */}
+      <div className="lg:col-span-3">
+        <TrainingMetricsChart status={status} />
+      </div>
+
+      {/* Row 3: Eval Results | Benchmark Comparison */}
+      <div className="lg:col-span-2">
+        <EvalResultsPanel status={status} />
+      </div>
+      <div className="lg:col-span-1">
+        <BenchmarkComparison status={status} />
+      </div>
+
+      {/* Row 4: Render Gallery (full width) */}
+      <div className="lg:col-span-3">
+        <RenderGallery status={status} />
+      </div>
+
+      {/* Row 5: Run History | Keyframes */}
       <div className="lg:col-span-1">
         <RunHistory status={status} />
       </div>
@@ -31,7 +53,7 @@ export default function Dashboard({ status }: Props) {
         <KeyframeBrowser status={status} />
       </div>
 
-      {/* Row 3: Point Cloud | Splat */}
+      {/* Row 6: Point Cloud | Splat */}
       <div className="lg:col-span-1 min-h-[400px]">
         <PointCloudViewer status={status} />
       </div>
