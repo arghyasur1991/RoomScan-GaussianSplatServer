@@ -479,8 +479,7 @@ def train(capture_dir: Path, args, log_fn=None):
 
 def train_msplat(capture_dir: Path, output_dir: Path, args, log_fn=None):
     save_interval = max(args.iterations // 5, 500)
-    cmd = [
-        sys.executable, "-m", "msplat.cli",
+    base_args = [
         "--input", str(capture_dir),
         "--output", str(output_dir / "splat.ply"),
         "--num-iters", str(args.iterations),
@@ -489,9 +488,17 @@ def train_msplat(capture_dir: Path, output_dir: Path, args, log_fn=None):
         "--keep-crs",
         "--save-every", str(save_interval),
     ]
+
+    # Try C++ binary from build dir first, then msplat-train, then Python module
+    msplat_build = Path.home() / "Personal/Projects/others/msplat/build/msplat"
+    if msplat_build.exists():
+        cmd = [str(msplat_build)] + base_args
+    else:
+        cmd = [sys.executable, "-m", "msplat.cli"] + base_args
+
     rc = _run_with_logging(cmd, log_fn)
-    if rc != 0:
-        cmd[0:3] = ["msplat-train"]
+    if rc != 0 and cmd[0] != "msplat-train":
+        cmd = ["msplat-train"] + base_args
         rc = _run_with_logging(cmd, log_fn)
         if rc != 0:
             raise RuntimeError(f"msplat training failed with exit code {rc}")
