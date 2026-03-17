@@ -493,10 +493,11 @@ def train_msplat(capture_dir: Path, output_dir: Path, args, log_fn=None):
             "--keep-crs",
             "--save-every", str(save_interval),
             "--random-bg",
-            "--3d-filter",
         ]
         if getattr(args, "strategy", None) == "mcmc":
             cmd += ["--strategy", "mcmc"]
+        if getattr(args, "use_3d_filter", False):
+            cmd += ["--3d-filter"]
         if getattr(args, "bilateral_grid", False):
             cmd += ["--bilateral-grid"]
 
