@@ -493,6 +493,7 @@ def train_msplat(capture_dir: Path, output_dir: Path, args, log_fn=None):
             "--keep-crs",
             "--save-every", str(save_interval),
             "--random-bg",
+            "--stop-split-at", "2000",
         ]
         if getattr(args, "strategy", None) == "mcmc":
             cmd += ["--strategy", "mcmc"]
