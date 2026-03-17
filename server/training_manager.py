@@ -533,17 +533,28 @@ class TrainingManager:
         self._parse_iteration(line)
 
     def _parse_iteration(self, line: str):
-        for pattern in _ITER_PATTERNS:
-            m = pattern.search(line)
-            if m:
-                current = int(m.group(1))
-                total = int(m.group(2))
-                with self._lock:
-                    self.current_iteration = current
-                    self.total_iterations = total
-                    self.progress = 0.2 + 0.8 * (current / max(total, 1))
-                    self.message = f"Training... {current}/{total}"
-                return
+        # Check eval patterns FIRST — they contain [N/M] which would
+        # otherwise be caught by the generic _ITER_PATTERNS
+        m = _EVAL_VIEW_PATTERN.search(line)
+        if m:
+            with self._lock:
+                self._eval_per_view.append({
+                    "name": m.group(3),
+                    "psnr": float(m.group(4)),
+                    "ssim": float(m.group(5)),
+                    "l1": float(m.group(6)),
+                })
+                self.message = f"Evaluating... {m.group(1)}/{m.group(2)}"
+            return
+
+        m = _EVAL_SUMMARY_PATTERN.search(line)
+        if m:
+            with self._lock:
+                self.eval_psnr = float(m.group(1))
+                self.eval_ssim = float(m.group(2))
+                self.eval_l1 = float(m.group(3))
+                self.gaussian_count = int(m.group(4).replace(",", ""))
+            return
 
         m = _MSPLAT_METRICS_PATTERN.search(line)
         if m:
@@ -570,24 +581,17 @@ class TrainingManager:
                 self.message = f"Training... {current}/{total}"
             return
 
-        m = _EVAL_VIEW_PATTERN.search(line)
-        if m:
-            with self._lock:
-                self._eval_per_view.append({
-                    "name": m.group(3),
-                    "psnr": float(m.group(4)),
-                    "ssim": float(m.group(5)),
-                    "l1": float(m.group(6)),
-                })
-            return
-
-        m = _EVAL_SUMMARY_PATTERN.search(line)
-        if m:
-            with self._lock:
-                self.eval_psnr = float(m.group(1))
-                self.eval_ssim = float(m.group(2))
-                self.eval_l1 = float(m.group(3))
-                self.gaussian_count = int(m.group(4).replace(",", ""))
+        for pattern in _ITER_PATTERNS:
+            m = pattern.search(line)
+            if m:
+                current = int(m.group(1))
+                total = int(m.group(2))
+                with self._lock:
+                    self.current_iteration = current
+                    self.total_iterations = total
+                    self.progress = 0.2 + 0.8 * (current / max(total, 1))
+                    self.message = f"Training... {current}/{total}"
+                return
 
     def _run(self, zip_data: bytes):
         try:
