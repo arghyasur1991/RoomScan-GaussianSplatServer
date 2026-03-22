@@ -19,7 +19,9 @@ from pathlib import Path
 
 import numpy as np
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("texture_refine")
+logger.setLevel(logging.INFO)
 
 
 def get_device():
@@ -336,7 +338,11 @@ def refine_texture(run_dir: Path, num_steps: int = 300) -> Path:
     # Pre-compute correspondences
     logger.info("Computing UV-to-pixel correspondences...")
     correspondences = compute_correspondences(mesh, keyframes)
-    logger.info(f"Found {len(correspondences['correspondences'])} correspondences")
+    n_corr = len(correspondences['correspondences'])
+    filled = int(np.sum(correspondences['best_score'] > 0))
+    total_texels = correspondences['atlas_w'] * correspondences['atlas_h']
+    logger.info(f"Found {n_corr} correspondences, {filled}/{total_texels} texels covered "
+                f"({100*filled/max(total_texels,1):.1f}%)")
 
     # Optimize
     logger.info(f"Running differentiable optimization ({num_steps} steps)...")
