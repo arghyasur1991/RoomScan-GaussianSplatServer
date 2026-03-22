@@ -182,6 +182,9 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
 
     for kf_idx, kf in enumerate(keyframes):
         view_mat = build_view_matrix(kf["position"], kf["rotation"])
+        if not np.isfinite(view_mat).all():
+            logger.warning(f"Skipping keyframe {kf_idx}: non-finite view matrix")
+            continue
         cam_pos = kf["position"]
         fx, fy, cx, cy = kf["fx"], kf["fy"], kf["cx"], kf["cy"]
         w, h = kf["width"], kf["height"]
@@ -282,10 +285,10 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
                 best_score[b_texels] = v_scores[b_idx]
                 best_color[b_texels] = pixels[b_py, b_sx]
 
-            # Append correspondences
-            for j in v_idx:
+            # Append correspondences (iterate V-length filtered arrays)
+            for j in range(len(v_idx)):
                 texel_indices_list.append((
-                    int(texel_ids[j]), kf_idx, int(v_sx[j]), int(py_arr[j]), float(scores[j])
+                    int(texel_ids[j]), kf_idx, int(v_sx[j]), int(py_arr[j]), float(v_scores[j])
                 ))
 
         if kf_idx % 20 == 0:
