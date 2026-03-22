@@ -57,12 +57,16 @@ app.add_middleware(NoCacheAPIMiddleware)
 # ═══════════════════════════════════════════════════════════════════════
 
 _refine_lock = asyncio.Lock()
+REFINE_DIR = WORK_DIR / "refine_runs"
+REFINE_DIR.mkdir(parents=True, exist_ok=True)
+MAX_REFINE_RUNS = 10
 
 @app.post("/refine-texture")
 async def refine_texture(request: Request, steps: int | None = None):
     """
     HQ texture refinement: receives ZIP with keyframes + refined_mesh.bin,
     runs differentiable atlas optimization, returns PNG atlas.
+    Data is persisted in a timestamped directory under refine_runs/.
     """
     if _refine_lock.locked():
         return JSONResponse(status_code=409, content={"error": "Refinement already in progress"})
@@ -72,22 +76,33 @@ async def refine_texture(request: Request, steps: int | None = None):
         return JSONResponse(status_code=400, content={"error": "Empty body"})
 
     async with _refine_lock:
-        import zipfile, io, tempfile, shutil, logging
+        import zipfile, io, logging
+        from datetime import datetime
         from texture_refine import refine_texture as do_refine
 
         logger = logging.getLogger("texture_refine")
-        tmp_dir = None
         try:
-            tmp_dir = Path(tempfile.mkdtemp(prefix="texrefine_", dir=WORK_DIR))
-            logger.info(f"Extracting refinement data to {tmp_dir}")
+            name = datetime.now().strftime("texrefine_%Y%m%d_%H%M%S")
+            run_dir = REFINE_DIR / name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Extracting refinement data to {run_dir}")
 
             zf = zipfile.ZipFile(io.BytesIO(body))
-            zf.extractall(tmp_dir)
+            zf.extractall(run_dir)
+
+            # Cleanup oldest runs beyond limit
+            runs = sorted([d for d in REFINE_DIR.iterdir() if d.is_dir()], key=lambda d: d.name)
+            import shutil
+            while len(runs) > MAX_REFINE_RUNS:
+                oldest = runs.pop(0)
+                if oldest != run_dir:
+                    shutil.rmtree(oldest, ignore_errors=True)
+                    logger.info(f"Cleaned up old refine run: {oldest.name}")
 
             num_steps = steps if steps and steps > 0 else 300
 
             loop = asyncio.get_event_loop()
-            out_path = await loop.run_in_executor(None, do_refine, tmp_dir, num_steps)
+            out_path = await loop.run_in_executor(None, do_refine, run_dir, num_steps)
 
             if not out_path.exists():
                 return JSONResponse(status_code=500, content={"error": "Refinement produced no output"})
@@ -98,9 +113,6 @@ async def refine_texture(request: Request, steps: int | None = None):
         except Exception as e:
             logger.exception("Texture refinement failed")
             return JSONResponse(status_code=500, content={"error": str(e)})
-        finally:
-            if tmp_dir and tmp_dir.exists():
-                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════
