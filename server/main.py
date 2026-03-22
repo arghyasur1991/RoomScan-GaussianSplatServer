@@ -53,6 +53,57 @@ app.add_middleware(NoCacheAPIMiddleware)
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Texture Refinement API
+# ═══════════════════════════════════════════════════════════════════════
+
+_refine_lock = asyncio.Lock()
+
+@app.post("/refine-texture")
+async def refine_texture(request: Request, steps: int | None = None):
+    """
+    HQ texture refinement: receives ZIP with keyframes + refined_mesh.bin,
+    runs differentiable atlas optimization, returns PNG atlas.
+    """
+    if _refine_lock.locked():
+        return JSONResponse(status_code=409, content={"error": "Refinement already in progress"})
+
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    async with _refine_lock:
+        import zipfile, io, tempfile, shutil, logging
+        from texture_refine import refine_texture as do_refine
+
+        logger = logging.getLogger("texture_refine")
+        tmp_dir = None
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="texrefine_", dir=WORK_DIR))
+            logger.info(f"Extracting refinement data to {tmp_dir}")
+
+            zf = zipfile.ZipFile(io.BytesIO(body))
+            zf.extractall(tmp_dir)
+
+            num_steps = steps if steps and steps > 0 else 300
+
+            loop = asyncio.get_event_loop()
+            out_path = await loop.run_in_executor(None, do_refine, tmp_dir, num_steps)
+
+            if not out_path.exists():
+                return JSONResponse(status_code=500, content={"error": "Refinement produced no output"})
+
+            png_data = out_path.read_bytes()
+            return Response(content=png_data, media_type="image/png")
+
+        except Exception as e:
+            logger.exception("Texture refinement failed")
+            return JSONResponse(status_code=500, content={"error": str(e)})
+        finally:
+            if tmp_dir and tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Quest API (backward-compatible with GSplatServerClient.cs)
 # ═══════════════════════════════════════════════════════════════════════
 

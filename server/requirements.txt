@@ -4,3 +4,5 @@ numpy
 scipy
 plyfile
 msplat[cli]
+torch
+Pillow
