@@ -84,6 +84,11 @@ def load_keyframes(run_dir: Path) -> list[dict]:
         img = Image.open(img_path).convert("RGB")
         pixels = np.array(img, dtype=np.float32) / 255.0  # H x W x 3
 
+        sw = meta.get("sw", img.width)
+        sh = meta.get("sh", img.height)
+        crop_x = (sw - img.width) * 0.5
+        crop_y = (sh - img.height) * 0.5
+
         keyframes.append({
             "pixels": pixels,
             "width": img.width,
@@ -91,7 +96,7 @@ def load_keyframes(run_dir: Path) -> list[dict]:
             "position": np.array([meta["px"], meta["py"], meta["pz"]], dtype=np.float32),
             "rotation": np.array([meta["qx"], meta["qy"], meta["qz"], meta["qw"]], dtype=np.float32),
             "fx": meta["fx"], "fy": meta["fy"],
-            "cx": meta["cx"], "cy": meta["cy"],
+            "cx": meta["cx"] - crop_x, "cy": meta["cy"] - crop_y,
         })
 
     return keyframes
@@ -215,12 +220,15 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
 
                 texel_idx = ty * atlas_w + tx
 
+                # PIL row 0 = top of image, but projection Y increases upward
+                py = kf["height"] - 1 - sy
+
                 # Best-view initialization
                 if score > best_score[texel_idx]:
                     best_score[texel_idx] = score
-                    best_color[texel_idx] = kf["pixels"][sy, sx]
+                    best_color[texel_idx] = kf["pixels"][py, sx]
 
-                texel_indices_list.append((texel_idx, kf_idx, sx, sy, score))
+                texel_indices_list.append((texel_idx, kf_idx, sx, py, score))
 
         if kf_idx % 20 == 0:
             logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
