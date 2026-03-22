@@ -138,97 +138,155 @@ def project_to_screen(world_pts: np.ndarray, view_mat: np.ndarray,
 def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
     """
     Pre-compute which atlas texels correspond to which keyframe pixels.
-    Returns per-texel best-view info for initialization + multi-view index lists
-    for optimization.
+    Vectorized: all triangles processed per keyframe in batched NumPy ops.
     """
     atlas_w, atlas_h = mesh["atlas_w"], mesh["atlas_h"]
-    uvs = mesh["uvs"]  # Nx2 in [0,1]
+    uvs = mesh["uvs"]
     positions = mesh["positions"]
     normals = mesh["normals"]
-    indices = mesh["indices"]
+    indices = mesh["indices"]  # Tx3
 
+    T = indices.shape[0]
     texel_count = atlas_w * atlas_h
     best_score = np.full(texel_count, -1.0, dtype=np.float32)
     best_color = np.zeros((texel_count, 3), dtype=np.float32)
+    texel_indices_list = []
 
-    # Multi-view correspondences for optimization
-    texel_indices_list = []  # list of (texel_idx, kf_idx, px, py, score)
+    # Pre-compute per-triangle constants (invariant across keyframes)
+    i0s, i1s, i2s = indices[:, 0], indices[:, 1], indices[:, 2]
+    p0s = positions[i0s]  # Tx3
+    p1s = positions[i1s]
+    p2s = positions[i2s]
+    n0s = normals[i0s]
+
+    face_normals = np.cross(p1s - p0s, p2s - p0s)  # Tx3
+    norm_lens = np.linalg.norm(face_normals, axis=1, keepdims=True)  # Tx1
+    degenerate = (norm_lens.ravel() < 1e-6)
+    safe_lens = np.where(norm_lens < 1e-6, 1.0, norm_lens)
+    face_normals = np.where(degenerate[:, None], n0s, face_normals / safe_lens)
+
+    centroids = (p0s + p1s + p2s) / 3.0  # Tx3
+
+    # UV coords in atlas pixel space
+    uv_scale = np.array([atlas_w, atlas_h], dtype=np.float32)
+    uv0s = uvs[i0s] * uv_scale  # Tx2
+    uv1s = uvs[i1s] * uv_scale
+    uv2s = uvs[i2s] * uv_scale
+
+    bary_weights = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1/3, 1/3, 1/3],
+    ], dtype=np.float32)  # 4x3
 
     for kf_idx, kf in enumerate(keyframes):
         view_mat = build_view_matrix(kf["position"], kf["rotation"])
         cam_pos = kf["position"]
+        fx, fy, cx, cy = kf["fx"], kf["fy"], kf["cx"], kf["cy"]
+        w, h = kf["width"], kf["height"]
 
-        tri_count = indices.shape[0]
-        for t in range(tri_count):
-            i0, i1, i2 = indices[t]
-            p0, p1, p2 = positions[i0], positions[i1], positions[i2]
-            n0 = normals[i0]
+        # Batch view direction + dot product
+        view_dirs = cam_pos - centroids  # Tx3
+        dists = np.linalg.norm(view_dirs, axis=1)  # T
+        safe_dists = np.maximum(dists, 0.01)
+        view_dirs_n = view_dirs / safe_dists[:, None]
+        dots = np.sum(face_normals * view_dirs_n, axis=1)  # T
 
-            face_normal = np.cross(p1 - p0, p2 - p0)
-            norm_len = np.linalg.norm(face_normal)
-            if norm_len < 1e-6:
-                face_normal = n0
-            else:
-                face_normal = face_normal / norm_len
+        # Filter: dot > 0.05 and dist >= 0.01
+        mask = (dots > 0.05) & (dists >= 0.01)
+        if not np.any(mask):
+            if kf_idx % 20 == 0:
+                logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
+            continue
 
-            centroid = (p0 + p1 + p2) / 3.0
-            view_dir = cam_pos - centroid
-            dist = np.linalg.norm(view_dir)
-            if dist < 0.01:
-                continue
-            view_dir /= dist
+        # Batch project all 3 vertex sets for surviving triangles
+        m_idx = np.where(mask)[0]
+        m_p0 = p0s[m_idx]  # Mx3
+        m_p1 = p1s[m_idx]
+        m_p2 = p2s[m_idx]
 
-            dot = float(np.dot(face_normal, view_dir))
-            if dot <= 0.05:
-                continue
+        all_verts = np.concatenate([m_p0, m_p1, m_p2], axis=0)  # 3Mx3
+        screen_all, camz_all = project_to_screen(all_verts, view_mat, fx, fy, cx, cy)
+        M = len(m_idx)
+        s0 = screen_all[:M]      # Mx2
+        s1 = screen_all[M:2*M]
+        s2 = screen_all[2*M:]
+        z0 = camz_all[:M]
+        z1 = camz_all[M:2*M]
+        z2 = camz_all[2*M:]
 
-            # Project vertices to screen
-            verts = np.stack([p0, p1, p2])
-            screen_xy, cam_z = project_to_screen(verts, view_mat,
-                                                  kf["fx"], kf["fy"], kf["cx"], kf["cy"])
+        # Frustum: at least one vertex in-bounds
+        in_bounds = lambda s: (s[:, 0] >= 0) & (s[:, 0] < w) & (s[:, 1] >= 0) & (s[:, 1] < h)
+        frustum_ok = in_bounds(s0) | in_bounds(s1) | in_bounds(s2)
+        any_z_ok = (z0 > 0) | (z1 > 0) | (z2 > 0)
+        keep = frustum_ok & any_z_ok
 
-            if np.all(cam_z <= 0):
-                continue
+        if not np.any(keep):
+            if kf_idx % 20 == 0:
+                logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
+            continue
 
-            # Check frustum
-            in_frustum = np.any(
-                (screen_xy[:, 0] >= 0) & (screen_xy[:, 0] < kf["width"]) &
-                (screen_xy[:, 1] >= 0) & (screen_xy[:, 1] < kf["height"])
+        k_idx = np.where(keep)[0]
+        k_global = m_idx[k_idx]
+        k_s0 = s0[k_idx]
+        k_s1 = s1[k_idx]
+        k_s2 = s2[k_idx]
+        k_dots = dots[k_global]
+        k_dists = np.maximum(dists[k_global], 0.1)
+        scores = k_dots / k_dists  # K
+
+        k_uv0 = uv0s[k_global]
+        k_uv1 = uv1s[k_global]
+        k_uv2 = uv2s[k_global]
+
+        pixels = kf["pixels"]
+
+        # For each barycentric weight, compute atlas + screen coords in batch
+        for bw0, bw1, bw2 in bary_weights:
+            uv_px = bw0 * k_uv0 + bw1 * k_uv1 + bw2 * k_uv2  # Kx2
+            scr = bw0 * k_s0 + bw1 * k_s1 + bw2 * k_s2  # Kx2
+
+            tx = uv_px[:, 0].astype(np.int32)
+            ty = uv_px[:, 1].astype(np.int32)
+            sx = np.round(scr[:, 0]).astype(np.int32)
+            sy = np.round(scr[:, 1]).astype(np.int32)
+
+            valid = (
+                (tx >= 0) & (tx < atlas_w) &
+                (ty >= 0) & (ty < atlas_h) &
+                (sx >= 0) & (sx < w) &
+                (sy >= 0) & (sy < h)
             )
-            if not in_frustum:
+
+            v_idx = np.where(valid)[0]
+            if len(v_idx) == 0:
                 continue
 
-            score = dot / max(dist, 0.1)
+            v_tx = tx[v_idx]
+            v_ty = ty[v_idx]
+            v_sx = sx[v_idx]
+            v_sy = sy[v_idx]
+            v_scores = scores[v_idx]
 
-            # UV coordinates in atlas pixel space
-            uv0 = uvs[i0] * [atlas_w, atlas_h]
-            uv1 = uvs[i1] * [atlas_w, atlas_h]
-            uv2 = uvs[i2] * [atlas_w, atlas_h]
+            texel_ids = v_ty * atlas_w + v_tx
+            py_arr = h - 1 - v_sy
 
-            # Rasterize triangle in UV space (simplified — just sample vertices and centroid)
-            for bw in [(1, 0, 0), (0, 1, 0), (0, 0, 1), (1/3, 1/3, 1/3)]:
-                uv_px = bw[0] * uv0 + bw[1] * uv1 + bw[2] * uv2
-                scr = bw[0] * screen_xy[0] + bw[1] * screen_xy[1] + bw[2] * screen_xy[2]
+            # Update best-view initialization
+            better = v_scores > best_score[texel_ids]
+            b_idx = np.where(better)[0]
+            if len(b_idx) > 0:
+                b_texels = texel_ids[b_idx]
+                b_py = py_arr[b_idx]
+                b_sx = v_sx[b_idx]
+                best_score[b_texels] = v_scores[b_idx]
+                best_color[b_texels] = pixels[b_py, b_sx]
 
-                tx, ty = int(uv_px[0]), int(uv_px[1])
-                if tx < 0 or tx >= atlas_w or ty < 0 or ty >= atlas_h:
-                    continue
-
-                sx, sy = int(round(scr[0])), int(round(scr[1]))
-                if sx < 0 or sx >= kf["width"] or sy < 0 or sy >= kf["height"]:
-                    continue
-
-                texel_idx = ty * atlas_w + tx
-
-                # PIL row 0 = top of image, but projection Y increases upward
-                py = kf["height"] - 1 - sy
-
-                # Best-view initialization
-                if score > best_score[texel_idx]:
-                    best_score[texel_idx] = score
-                    best_color[texel_idx] = kf["pixels"][py, sx]
-
-                texel_indices_list.append((texel_idx, kf_idx, sx, py, score))
+            # Append correspondences
+            for j in v_idx:
+                texel_indices_list.append((
+                    int(texel_ids[j]), kf_idx, int(v_sx[j]), int(py_arr[j]), float(scores[j])
+                ))
 
         if kf_idx % 20 == 0:
             logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
@@ -243,7 +301,8 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
 
 
 def optimize_atlas(correspondences: dict, keyframes: list[dict],
-                   num_steps: int = 300, lr: float = 0.01) -> np.ndarray:
+                   num_steps: int = 300, lr: float = 0.01,
+                   progress_fn: callable = None) -> np.ndarray:
     """
     Differentiable texture optimization using pure PyTorch ops.
     Works on MPS, CUDA, or CPU.
@@ -316,12 +375,14 @@ def optimize_atlas(correspondences: dict, keyframes: list[dict],
 
         if step % 50 == 0 or step == num_steps - 1:
             logger.info(f"Step {step}/{num_steps}, loss={loss.item():.6f}")
+            if progress_fn:
+                progress_fn(step, num_steps, loss.item())
 
     result = atlas.detach().cpu().numpy()
     return result
 
 
-def refine_texture(run_dir: Path, num_steps: int = 300) -> Path:
+def refine_texture(run_dir: Path, num_steps: int = 300, progress_fn: callable = None) -> Path:
     """
     Full server-side texture refinement pipeline.
     Returns path to the output PNG atlas.
@@ -354,7 +415,8 @@ def refine_texture(run_dir: Path, num_steps: int = 300) -> Path:
 
     # Optimize
     logger.info(f"Running differentiable optimization ({num_steps} steps)...")
-    atlas_float = optimize_atlas(correspondences, keyframes, num_steps=num_steps)
+    atlas_float = optimize_atlas(correspondences, keyframes, num_steps=num_steps,
+                                  progress_fn=progress_fn)
 
     # Convert to uint8 and save as PNG
     atlas_uint8 = (np.clip(atlas_float, 0, 1) * 255).astype(np.uint8)
