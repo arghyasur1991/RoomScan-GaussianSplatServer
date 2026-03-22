@@ -127,12 +127,118 @@ def project_to_screen(world_pts: np.ndarray, view_mat: np.ndarray,
     """Project Nx3 world points to Nx2 screen coords. Returns (screen_xy, cam_z)."""
     ones = np.ones((world_pts.shape[0], 1), dtype=np.float32)
     pts4 = np.hstack([world_pts, ones])
-    cam = (view_mat @ pts4.T).T  # Nx4
+    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+        cam = (view_mat @ pts4.T).T  # Nx4
     cam_z = cam[:, 2]
-    valid = cam_z > 0.001
-    screen_x = np.where(valid, fx * cam[:, 0] / np.maximum(cam_z, 0.001) + cx, -1)
-    screen_y = np.where(valid, fy * cam[:, 1] / np.maximum(cam_z, 0.001) + cy, -1)
+    valid = (cam_z > 0.001) & np.isfinite(cam_z)
+    safe_z = np.where(valid, cam_z, 1.0)
+    screen_x = np.where(valid, fx * cam[:, 0] / safe_z + cx, -1)
+    screen_y = np.where(valid, fy * cam[:, 1] / safe_z + cy, -1)
     return np.stack([screen_x, screen_y], axis=1), cam_z
+
+
+def _rasterize_triangles_vectorized(
+    uv0s, uv1s, uv2s, s0s, s1s, s2s, scores,
+    atlas_w, atlas_h, img_w, img_h, kf_idx, pixels,
+    best_score, best_color, texel_indices_list,
+):
+    """Rasterize all visible triangles into atlas space using batched NumPy ops."""
+    K = len(uv0s)
+    if K == 0:
+        return
+
+    BATCH = 256
+    for batch_start in range(0, K, BATCH):
+        batch_end = min(batch_start + BATCH, K)
+        b_uv0 = uv0s[batch_start:batch_end]
+        b_uv1 = uv1s[batch_start:batch_end]
+        b_uv2 = uv2s[batch_start:batch_end]
+        b_s0 = s0s[batch_start:batch_end]
+        b_s1 = s1s[batch_start:batch_end]
+        b_s2 = s2s[batch_start:batch_end]
+        b_scores = scores[batch_start:batch_end]
+
+        b_min_x = np.floor(np.minimum(np.minimum(b_uv0[:, 0], b_uv1[:, 0]), b_uv2[:, 0])).astype(np.int32)
+        b_max_x = np.ceil(np.maximum(np.maximum(b_uv0[:, 0], b_uv1[:, 0]), b_uv2[:, 0])).astype(np.int32)
+        b_min_y = np.floor(np.minimum(np.minimum(b_uv0[:, 1], b_uv1[:, 1]), b_uv2[:, 1])).astype(np.int32)
+        b_max_y = np.ceil(np.maximum(np.maximum(b_uv0[:, 1], b_uv1[:, 1]), b_uv2[:, 1])).astype(np.int32)
+
+        np.clip(b_min_x, 0, atlas_w - 1, out=b_min_x)
+        np.clip(b_max_x, 0, atlas_w - 1, out=b_max_x)
+        np.clip(b_min_y, 0, atlas_h - 1, out=b_min_y)
+        np.clip(b_max_y, 0, atlas_h - 1, out=b_max_y)
+
+        denom = (b_uv1[:, 1] - b_uv2[:, 1]) * (b_uv0[:, 0] - b_uv2[:, 0]) + \
+                (b_uv2[:, 0] - b_uv1[:, 0]) * (b_uv0[:, 1] - b_uv2[:, 1])
+
+        for ti in range(batch_end - batch_start):
+            if abs(denom[ti]) < 1e-8:
+                continue
+            inv_d = 1.0 / denom[ti]
+            u0x, u0y = b_uv0[ti]
+            u1x, u1y = b_uv1[ti]
+            u2x, u2y = b_uv2[ti]
+            mn_x, mx_x = int(b_min_x[ti]), int(b_max_x[ti])
+            mn_y, mx_y = int(b_min_y[ti]), int(b_max_y[ti])
+            span_x = mx_x - mn_x + 1
+            span_y = mx_y - mn_y + 1
+            if span_x <= 0 or span_y <= 0:
+                continue
+
+            px_arr = np.arange(mn_x, mx_x + 1, dtype=np.float32)
+            py_arr = np.arange(mn_y, mx_y + 1, dtype=np.float32)
+            gx, gy = np.meshgrid(px_arr, py_arr)
+            gx_flat = gx.ravel()
+            gy_flat = gy.ravel()
+
+            bw0 = ((u1y - u2y) * (gx_flat - u2x) + (u2x - u1x) * (gy_flat - u2y)) * inv_d
+            bw1 = ((u2y - u0y) * (gx_flat - u2x) + (u0x - u2x) * (gy_flat - u2y)) * inv_d
+            bw2 = 1.0 - bw0 - bw1
+
+            inside = (bw0 >= -0.001) & (bw1 >= -0.001) & (bw2 >= -0.001)
+            if not np.any(inside):
+                continue
+
+            idx_in = np.where(inside)[0]
+            bw0_in = bw0[idx_in]
+            bw1_in = bw1[idx_in]
+            bw2_in = bw2[idx_in]
+
+            sc0, sc1, sc2 = b_s0[ti], b_s1[ti], b_s2[ti]
+            sx = bw0_in * sc0[0] + bw1_in * sc1[0] + bw2_in * sc2[0]
+            sy = bw0_in * sc0[1] + bw1_in * sc1[1] + bw2_in * sc2[1]
+            ipx = np.round(sx).astype(np.int32)
+            ipy_screen = np.round(sy).astype(np.int32)
+
+            scr_ok = (ipx >= 0) & (ipx < img_w) & (ipy_screen >= 0) & (ipy_screen < img_h)
+            if not np.any(scr_ok):
+                continue
+
+            ok_idx = np.where(scr_ok)[0]
+            f_gx = gx_flat[idx_in[ok_idx]].astype(np.int32)
+            f_gy = gy_flat[idx_in[ok_idx]].astype(np.int32)
+            f_ipx = ipx[ok_idx]
+            f_ipy_screen = ipy_screen[ok_idx]
+            f_ipy_img = img_h - 1 - f_ipy_screen
+            f_texel = f_gy * atlas_w + f_gx
+
+            score = float(b_scores[ti])
+
+            better = score > best_score[f_texel]
+            if np.any(better):
+                b_ids = np.where(better)[0]
+                b_t = f_texel[b_ids]
+                best_score[b_t] = score
+                best_color[b_t] = pixels[f_ipy_img[b_ids], f_ipx[b_ids]]
+
+            n = len(f_texel)
+            chunk = np.empty((n, 5), dtype=np.float32)
+            chunk[:, 0] = f_texel
+            chunk[:, 1] = kf_idx
+            chunk[:, 2] = f_ipx
+            chunk[:, 3] = f_ipy_img
+            chunk[:, 4] = score
+            texel_indices_list.append(chunk)
 
 
 def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
@@ -173,13 +279,6 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
     uv1s = uvs[i1s] * uv_scale
     uv2s = uvs[i2s] * uv_scale
 
-    bary_weights = np.array([
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [1/3, 1/3, 1/3],
-    ], dtype=np.float32)  # 4x3
-
     for kf_idx, kf in enumerate(keyframes):
         view_mat = build_view_matrix(kf["position"], kf["rotation"])
         if not np.isfinite(view_mat).all():
@@ -196,30 +295,27 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
         view_dirs_n = view_dirs / safe_dists[:, None]
         dots = np.sum(face_normals * view_dirs_n, axis=1)  # T
 
-        # Filter: dot > 0.05 and dist >= 0.01
         mask = (dots > 0.05) & (dists >= 0.01)
         if not np.any(mask):
             if kf_idx % 20 == 0:
                 logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
             continue
 
-        # Batch project all 3 vertex sets for surviving triangles
         m_idx = np.where(mask)[0]
-        m_p0 = p0s[m_idx]  # Mx3
+        m_p0 = p0s[m_idx]
         m_p1 = p1s[m_idx]
         m_p2 = p2s[m_idx]
 
-        all_verts = np.concatenate([m_p0, m_p1, m_p2], axis=0)  # 3Mx3
+        all_verts = np.concatenate([m_p0, m_p1, m_p2], axis=0)
         screen_all, camz_all = project_to_screen(all_verts, view_mat, fx, fy, cx, cy)
         M = len(m_idx)
-        s0 = screen_all[:M]      # Mx2
+        s0 = screen_all[:M]
         s1 = screen_all[M:2*M]
         s2 = screen_all[2*M:]
         z0 = camz_all[:M]
         z1 = camz_all[M:2*M]
         z2 = camz_all[2*M:]
 
-        # Frustum: at least one vertex in-bounds
         in_bounds = lambda s: (s[:, 0] >= 0) & (s[:, 0] < w) & (s[:, 1] >= 0) & (s[:, 1] < h)
         frustum_ok = in_bounds(s0) | in_bounds(s1) | in_bounds(s2)
         any_z_ok = (z0 > 0) | (z1 > 0) | (z2 > 0)
@@ -237,7 +333,7 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
         k_s2 = s2[k_idx]
         k_dots = dots[k_global]
         k_dists = np.maximum(dists[k_global], 0.1)
-        scores = k_dots / k_dists  # K
+        scores = k_dots / k_dists
 
         k_uv0 = uv0s[k_global]
         k_uv1 = uv1s[k_global]
@@ -245,51 +341,12 @@ def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
 
         pixels = kf["pixels"]
 
-        # For each barycentric weight, compute atlas + screen coords in batch
-        for bw0, bw1, bw2 in bary_weights:
-            uv_px = bw0 * k_uv0 + bw1 * k_uv1 + bw2 * k_uv2  # Kx2
-            scr = bw0 * k_s0 + bw1 * k_s1 + bw2 * k_s2  # Kx2
-
-            tx = uv_px[:, 0].astype(np.int32)
-            ty = uv_px[:, 1].astype(np.int32)
-            sx = np.round(scr[:, 0]).astype(np.int32)
-            sy = np.round(scr[:, 1]).astype(np.int32)
-
-            valid = (
-                (tx >= 0) & (tx < atlas_w) &
-                (ty >= 0) & (ty < atlas_h) &
-                (sx >= 0) & (sx < w) &
-                (sy >= 0) & (sy < h)
-            )
-
-            v_idx = np.where(valid)[0]
-            if len(v_idx) == 0:
-                continue
-
-            v_tx = tx[v_idx]
-            v_ty = ty[v_idx]
-            v_sx = sx[v_idx]
-            v_sy = sy[v_idx]
-            v_scores = scores[v_idx]
-
-            texel_ids = v_ty * atlas_w + v_tx
-            py_arr = h - 1 - v_sy
-
-            # Update best-view initialization
-            better = v_scores > best_score[texel_ids]
-            b_idx = np.where(better)[0]
-            if len(b_idx) > 0:
-                b_texels = texel_ids[b_idx]
-                b_py = py_arr[b_idx]
-                b_sx = v_sx[b_idx]
-                best_score[b_texels] = v_scores[b_idx]
-                best_color[b_texels] = pixels[b_py, b_sx]
-
-            # Append correspondences (iterate V-length filtered arrays)
-            for j in range(len(v_idx)):
-                texel_indices_list.append((
-                    int(texel_ids[j]), kf_idx, int(v_sx[j]), int(py_arr[j]), float(v_scores[j])
-                ))
+        # UV-space rasterization: vectorized per-triangle bounding-box scan
+        _rasterize_triangles_vectorized(
+            k_uv0, k_uv1, k_uv2, k_s0, k_s1, k_s2, scores,
+            atlas_w, atlas_h, w, h, kf_idx, pixels,
+            best_score, best_color, texel_indices_list,
+        )
 
         if kf_idx % 20 == 0:
             logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
@@ -326,23 +383,36 @@ def optimize_atlas(correspondences: dict, keyframes: list[dict],
     )
 
     # Build correspondence tensors
-    corr = correspondences["correspondences"]
-    if len(corr) == 0:
+    corr_chunks = correspondences["correspondences"]
+    if len(corr_chunks) == 0:
         logger.warning("No correspondences found, returning initial atlas")
         return initial
 
-    corr_arr = np.array(corr, dtype=np.float32)
+    corr_arr = np.concatenate(corr_chunks, axis=0) if isinstance(corr_chunks[0], np.ndarray) else np.array(corr_chunks, dtype=np.float32)
+
+    MAX_CORR = 10_000_000
+    if corr_arr.shape[0] > MAX_CORR:
+        logger.info(f"Subsampling correspondences: {corr_arr.shape[0]} -> {MAX_CORR}")
+        rng = np.random.default_rng(42)
+        idx = rng.choice(corr_arr.shape[0], MAX_CORR, replace=False)
+        corr_arr = corr_arr[idx]
+
+    n_corr = corr_arr.shape[0]
     texel_ids = torch.from_numpy(corr_arr[:, 0].astype(np.int64)).to(device)
     kf_ids = corr_arr[:, 1].astype(np.int32)
     pixel_xs = corr_arr[:, 2].astype(np.int32)
     pixel_ys = corr_arr[:, 3].astype(np.int32)
 
-    # Build target colors from keyframes
-    target_colors = np.zeros((len(corr), 3), dtype=np.float32)
-    for i in range(len(corr)):
-        ki = int(kf_ids[i])
-        px, py = int(pixel_xs[i]), int(pixel_ys[i])
-        target_colors[i] = keyframes[ki]["pixels"][py, px]
+    # Build target colors per-keyframe using vectorized indexing
+    target_colors = np.zeros((n_corr, 3), dtype=np.float32)
+    for ki in range(len(keyframes)):
+        mask = kf_ids == ki
+        if not np.any(mask):
+            continue
+        m_idx = np.where(mask)[0]
+        pxs = pixel_xs[m_idx]
+        pys = pixel_ys[m_idx]
+        target_colors[m_idx] = keyframes[ki]["pixels"][pys, pxs]
 
     target = torch.from_numpy(target_colors).to(device)
 
@@ -352,12 +422,11 @@ def optimize_atlas(correspondences: dict, keyframes: list[dict],
 
     optimizer = torch.optim.Adam([atlas], lr=lr)
 
-    batch_size = min(len(corr), 50000)
+    batch_size = min(n_corr, 50000)
 
     for step in range(num_steps):
-        # Random batch for large correspondence sets
-        if len(corr) > batch_size:
-            perm = torch.randperm(len(corr), device=device)[:batch_size]
+        if n_corr > batch_size:
+            perm = torch.randperm(n_corr, device=device)[:batch_size]
             b_rows = texel_rows[perm]
             b_cols = texel_cols[perm]
             b_target = target[perm]
@@ -410,7 +479,8 @@ def refine_texture(run_dir: Path, num_steps: int = 300, progress_fn: callable = 
     # Pre-compute correspondences
     logger.info("Computing UV-to-pixel correspondences...")
     correspondences = compute_correspondences(mesh, keyframes)
-    n_corr = len(correspondences['correspondences'])
+    corr_list = correspondences['correspondences']
+    n_corr = sum(c.shape[0] for c in corr_list) if corr_list and isinstance(corr_list[0], np.ndarray) else len(corr_list)
     filled = int(np.sum(correspondences['best_score'] > 0))
     total_texels = correspondences['atlas_w'] * correspondences['atlas_h']
     logger.info(f"Found {n_corr} correspondences, {filled}/{total_texels} texels covered "
