@@ -218,8 +218,7 @@ def _rasterize_triangles_vectorized(
             f_gx = gx_flat[idx_in[ok_idx]].astype(np.int32)
             f_gy = gy_flat[idx_in[ok_idx]].astype(np.int32)
             f_ipx = ipx[ok_idx]
-            f_ipy_screen = ipy_screen[ok_idx]
-            f_ipy_img = img_h - 1 - f_ipy_screen
+            f_ipy = ipy_screen[ok_idx]
             f_texel = f_gy * atlas_w + f_gx
 
             score = float(b_scores[ti])
@@ -229,14 +228,14 @@ def _rasterize_triangles_vectorized(
                 b_ids = np.where(better)[0]
                 b_t = f_texel[b_ids]
                 best_score[b_t] = score
-                best_color[b_t] = pixels[f_ipy_img[b_ids], f_ipx[b_ids]]
+                best_color[b_t] = pixels[f_ipy[b_ids], f_ipx[b_ids]]
 
             n = len(f_texel)
             chunk = np.empty((n, 5), dtype=np.float32)
             chunk[:, 0] = f_texel
             chunk[:, 1] = kf_idx
             chunk[:, 2] = f_ipx
-            chunk[:, 3] = f_ipy_img
+            chunk[:, 3] = f_ipy
             chunk[:, 4] = score
             texel_indices_list.append(chunk)
 
