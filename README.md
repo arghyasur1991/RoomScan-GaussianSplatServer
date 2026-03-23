@@ -1,10 +1,12 @@
 # RoomScan-GaussianSplatServer
 
-PC training server + web dashboard for [QuestRoomScan](https://github.com/arghyasur1991/QuestRoomScan) Gaussian Splatting pipeline.
+PC training server + web dashboard for [QuestRoomScan](https://github.com/arghyasur1991/QuestRoomScan) Gaussian Splatting pipeline, with experimental HQ texture refinement via differentiable rendering.
 
 ## Overview
 
 Receives captured keyframes and point cloud from a Meta Quest headset, runs COLMAP conversion + Gaussian Splat training, and serves the trained model back. Includes a real-time web dashboard for monitoring training, browsing keyframes, and interactively viewing point clouds and trained splats.
+
+Also provides an experimental **texture refinement API** (`/refine-texture`) that accepts a UV-unwrapped mesh + keyframes and optimizes a texture atlas via differentiable rendering (PyTorch, supports MPS/CUDA/CPU). **Note: this feature is currently broken** — the output atlas does not correctly correspond to room textures. On-device refinement in QuestRoomScan is the recommended path.
 
 ![Web Dashboard](docs/gs-webapp.png)
 
@@ -85,6 +87,16 @@ These are called by the Quest app's `GSplatServerClient`:
 | `GET` | `/status` | Training status JSON (`{state, iteration, total_iterations, elapsed}`) |
 | `GET` | `/download` | Download trained `splat.ply` (denormalized to world coordinates) |
 | `POST` | `/cancel` | Cancel in-progress training |
+
+### Texture Refinement Endpoints (experimental — currently broken)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/refine-texture?steps=N` | Upload ZIP of UV mesh + keyframes; starts async differentiable texture optimization |
+| `GET` | `/refine-texture/status` | Poll refinement progress (`{state, progress, message}`) |
+| `GET` | `/refine-texture/result` | Download the optimized atlas PNG when refinement is done |
+
+Refinement runs are persisted in `gs_server_work/refine_runs/` (up to 10, oldest auto-cleaned).
 
 ### Dashboard Endpoints
 
