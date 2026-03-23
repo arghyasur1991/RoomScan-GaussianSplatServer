@@ -53,6 +53,142 @@ app.add_middleware(NoCacheAPIMiddleware)
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Texture Refinement API
+# ═══════════════════════════════════════════════════════════════════════
+
+import threading
+
+REFINE_DIR = WORK_DIR / "refine_runs"
+REFINE_DIR.mkdir(parents=True, exist_ok=True)
+MAX_REFINE_RUNS = 10
+
+_refine_state = {
+    "state": "idle",     # idle | processing | done | error
+    "progress": 0.0,
+    "message": "Ready",
+    "run_dir": None,
+    "output_path": None,
+}
+_refine_lock = threading.Lock()
+_refine_thread: threading.Thread | None = None
+
+
+def _run_refine_thread(run_dir: Path, num_steps: int):
+    import logging
+    from texture_refine import refine_texture as do_refine
+    logger = logging.getLogger("texture_refine")
+
+    def on_progress(step, total, loss):
+        with _refine_lock:
+            _refine_state["progress"] = step / max(total, 1)
+            _refine_state["message"] = f"Optimizing: step {step}/{total}, loss={loss:.6f}"
+
+    try:
+        with _refine_lock:
+            _refine_state["message"] = "Loading data..."
+            _refine_state["progress"] = 0.05
+
+        out_path = do_refine(run_dir, num_steps, progress_fn=on_progress)
+
+        with _refine_lock:
+            _refine_state["state"] = "done"
+            _refine_state["progress"] = 1.0
+            _refine_state["message"] = "Refinement complete"
+            _refine_state["output_path"] = out_path
+        logger.info(f"Texture refinement done: {out_path}")
+
+    except Exception as e:
+        logger.exception("Texture refinement failed")
+        with _refine_lock:
+            _refine_state["state"] = "error"
+            _refine_state["message"] = str(e)
+
+
+@app.post("/refine-texture")
+async def refine_texture_start(request: Request, steps: int | None = None):
+    """Start async HQ texture refinement. Returns immediately."""
+    global _refine_thread
+
+    with _refine_lock:
+        if _refine_state["state"] == "processing":
+            return JSONResponse(status_code=409, content={"error": "Refinement already in progress"})
+
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    import zipfile, io, shutil, logging
+    from datetime import datetime
+    logger = logging.getLogger("texture_refine")
+
+    try:
+        name = datetime.now().strftime("texrefine_%Y%m%d_%H%M%S")
+        run_dir = REFINE_DIR / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Extracting refinement data to {run_dir}")
+
+        zf = zipfile.ZipFile(io.BytesIO(body))
+        zf.extractall(run_dir)
+
+        runs = sorted([d for d in REFINE_DIR.iterdir() if d.is_dir()], key=lambda d: d.name)
+        while len(runs) > MAX_REFINE_RUNS:
+            oldest = runs.pop(0)
+            if oldest != run_dir:
+                shutil.rmtree(oldest, ignore_errors=True)
+                logger.info(f"Cleaned up old refine run: {oldest.name}")
+
+        num_steps = steps if steps and steps > 0 else 300
+
+        with _refine_lock:
+            _refine_state["state"] = "processing"
+            _refine_state["progress"] = 0.0
+            _refine_state["message"] = "Extracting data..."
+            _refine_state["run_dir"] = run_dir
+            _refine_state["output_path"] = None
+
+        _refine_thread = threading.Thread(
+            target=_run_refine_thread, args=(run_dir, num_steps), daemon=True
+        )
+        _refine_thread.start()
+
+        return {"status": "started", "run": name}
+
+    except Exception as e:
+        logger.exception("Failed to start texture refinement")
+        with _refine_lock:
+            _refine_state["state"] = "error"
+            _refine_state["message"] = str(e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/refine-texture/status")
+async def refine_texture_status():
+    """Poll refinement progress."""
+    with _refine_lock:
+        return {
+            "state": _refine_state["state"],
+            "progress": _refine_state["progress"],
+            "message": _refine_state["message"],
+        }
+
+
+@app.get("/refine-texture/result")
+async def refine_texture_result():
+    """Download the HQ atlas PNG once refinement is done."""
+    with _refine_lock:
+        if _refine_state["state"] != "done":
+            return JSONResponse(status_code=404, content={
+                "error": f"No result available (state={_refine_state['state']})"
+            })
+        out_path = _refine_state["output_path"]
+
+    if out_path is None or not out_path.exists():
+        return JSONResponse(status_code=404, content={"error": "Output file not found"})
+
+    return FileResponse(path=out_path, media_type="image/png", filename="hq_atlas.png")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Quest API (backward-compatible with GSplatServerClient.cs)
 # ═══════════════════════════════════════════════════════════════════════
 
