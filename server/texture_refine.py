@@ -157,169 +157,116 @@ def build_view_matrix(position: np.ndarray, rotation: np.ndarray) -> np.ndarray:
 #  PyTorch3D Differentiable Rendering Path
 # ═══════════════════════════════════════════════════════════════════════
 
-def _refine_pytorch3d(mesh: dict, keyframes: list[dict], num_steps: int,
-                      lr: float = 0.01, tv_weight: float = 0.001,
-                      render_size: int = 512,
-                      progress_fn: callable = None) -> np.ndarray:
+def _refine_multiview_blend(mesh: dict, keyframes: list[dict],
+                            top_k: int = 5, prerastd: dict = None,
+                            progress_fn: callable = None) -> np.ndarray:
     """
-    Differentiable rendering optimization using PyTorch3D.
-    Renders the mesh from each keyframe viewpoint, compares to the actual
-    keyframe image via photometric loss, and backprops to the atlas texture.
+    Weighted multi-view blending: for each texel, blend the top-K keyframe
+    observations weighted by their viewing score. Produces smoother, more
+    consistent textures than single-view selection without requiring GPU
+    differentiable rendering.
     """
-    import torch
-    import torch.nn.functional as F
-    from pytorch3d.structures import Meshes
-    from pytorch3d.renderer import (
-        PerspectiveCameras,
-        RasterizationSettings,
-        MeshRasterizer,
-        TexturesUV,
-    )
-
-    device = get_device()
-    logger.info(f"PyTorch3D refinement on {device}")
-
     atlas_w, atlas_h = mesh["atlas_w"], mesh["atlas_h"]
+    texel_count = atlas_w * atlas_h
 
-    # Unity uses left-handed coords (z forward), PyTorch3D uses right-handed (z backward)
-    # Flip Z for positions
-    positions = mesh["positions"].copy()
-    positions[:, 2] *= -1
+    if prerastd is None:
+        prerastd = _prerasterize_atlas(mesh)
 
-    verts = torch.from_numpy(positions).float().unsqueeze(0).to(device)
-    faces = torch.from_numpy(mesh["indices"].astype(np.int64)).unsqueeze(0).to(device)
+    texel_pos = prerastd["texel_pos"]
+    texel_norm = prerastd["texel_norm"]
+    filled_idx = prerastd["filled_idx"]
+    n_filled = len(filled_idx)
 
-    # UVs in mesh binary are already normalized [0,1]
-    verts_uvs = torch.from_numpy(mesh["uvs"].copy()).float().unsqueeze(0).to(device)
+    # For each texel, track top-K scores and corresponding colors
+    topk_scores = np.full((n_filled, top_k), -1.0, dtype=np.float32)
+    topk_colors = np.zeros((n_filled, top_k, 3), dtype=np.float32)
 
-    # Initialize atlas from best-view projection (fallback correspondences)
-    initial_atlas = _compute_initial_atlas(mesh, keyframes)
-    atlas_texture = torch.nn.Parameter(
-        torch.from_numpy(initial_atlas).float().unsqueeze(0).to(device)
-    )
-
-    textures = TexturesUV(
-        maps=atlas_texture,
-        faces_uvs=faces,
-        verts_uvs=verts_uvs,
-    )
-
-    py3d_mesh = Meshes(verts=verts, faces=faces, textures=textures)
-
-    raster_settings = RasterizationSettings(
-        image_size=render_size,
-        blur_radius=0.0,
-        faces_per_pixel=1,
-        cull_backfaces=True,
-    )
-
-    optimizer = torch.optim.Adam([atlas_texture], lr=lr)
+    ones_col = np.ones((n_filled, 1), dtype=np.float32)
+    pts4 = np.hstack([texel_pos, ones_col])
 
     n_kf = len(keyframes)
-    kf_per_step = min(4, n_kf)
 
-    for step in range(num_steps):
-        optimizer.zero_grad()
-        total_loss = torch.tensor(0.0, device=device)
+    for kf_idx, kf in enumerate(keyframes):
+        view_mat = build_view_matrix(kf["position"], kf["rotation"])
+        if not np.isfinite(view_mat).all():
+            continue
 
-        # Random subset of keyframes per step for efficiency
-        kf_indices = np.random.choice(n_kf, kf_per_step, replace=False)
+        cam_pos = kf["position"]
+        fx, fy, cx, cy = kf["fx"], kf["fy"], kf["cx"], kf["cy"]
+        w, h = kf["width"], kf["height"]
 
-        for ki in kf_indices:
-            kf = keyframes[ki]
+        view_dirs = cam_pos - texel_pos
+        dists = np.linalg.norm(view_dirs, axis=1)
+        safe_dists = np.maximum(dists, 0.01)
+        dots = np.sum(texel_norm * (view_dirs / safe_dists[:, None]), axis=1)
 
-            # Build PyTorch3D camera from keyframe intrinsics + extrinsics
-            R_np = quat_to_rotation_matrix(kf["rotation"])
-            # Flip Z axis for right-handed convention
-            R_np[:, 2] *= -1
-            R_np[2, :] *= -1
-            T_np = kf["position"].copy()
-            T_np[2] *= -1
+        visible = (dots > 0.05) & (dists >= 0.01)
+        if not np.any(visible):
+            continue
 
-            R = torch.from_numpy(R_np.T[np.newaxis]).float().to(device)
-            T = torch.from_numpy((-R_np.T @ T_np)[np.newaxis]).float().to(device)
+        scores = dots / np.maximum(dists, 0.1)
 
-            # Focal length in NDC: PyTorch3D expects focal_length in screen pixels
-            # then converts internally based on image_size
-            focal = torch.tensor([[kf["fx"], kf["fy"]]], dtype=torch.float32, device=device)
-            principal = torch.tensor([[kf["cx"], kf["cy"]]], dtype=torch.float32, device=device)
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            cam = (view_mat @ pts4.T).T
 
-            cameras = PerspectiveCameras(
-                R=R, T=T,
-                focal_length=focal,
-                principal_point=principal,
-                image_size=torch.tensor([[render_size, render_size]], device=device),
-                in_ndc=False,
-                device=device,
-            )
+        cam_z = cam[:, 2]
+        in_front = cam_z > 0.001
 
-            rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
+        sx = fx * cam[:, 0] / np.maximum(cam_z, 0.001) + cx
+        sy = fy * cam[:, 1] / np.maximum(cam_z, 0.001) + cy
 
-            # Update textures with current atlas
-            py3d_mesh.textures = TexturesUV(
-                maps=atlas_texture,
-                faces_uvs=faces,
-                verts_uvs=verts_uvs,
-            )
+        in_bounds = (sx >= 0) & (sx < w - 1) & (sy >= 0) & (sy < h - 1)
+        valid = visible & in_front & in_bounds
 
-            fragments = rasterizer(py3d_mesh)
+        # Check which valid texels have a score higher than the current min in top-K
+        current_min = topk_scores.min(axis=1)
+        candidates = valid & (scores > current_min)
 
-            # Sample texture at fragment UVs
-            pix_to_face = fragments.pix_to_face[..., 0]  # (1, H, W)
-            bary = fragments.bary_coords[..., 0, :]  # (1, H, W, 3)
+        if not np.any(candidates):
+            continue
 
-            valid_mask = pix_to_face >= 0
-            face_idx = pix_to_face.clamp(min=0)
+        ci = np.where(candidates)[0]
+        px_i = np.clip(np.round(sx[ci]).astype(np.int32), 0, w - 1)
+        py_i = np.clip(np.round(sy[ci]).astype(np.int32), 0, h - 1)
+        colors = kf["pixels"][py_i, px_i]
 
-            # Get per-pixel UV via barycentric interpolation
-            face_verts_uvs = verts_uvs[0][faces[0][face_idx.view(-1)]]  # (N, 3, 2)
-            face_verts_uvs = face_verts_uvs.view(1, render_size, render_size, 3, 2)
-            bary_expanded = bary.unsqueeze(-1)  # (1, H, W, 3, 1)
-            pixel_uvs = (face_verts_uvs * bary_expanded).sum(dim=-2)  # (1, H, W, 2)
+        # Insert into top-K: replace the slot with the lowest score
+        min_slot = topk_scores[ci].argmin(axis=1)
+        topk_scores[ci, min_slot] = scores[ci]
+        topk_colors[ci, min_slot, :] = colors
 
-            # Sample atlas at these UVs using grid_sample
-            # grid_sample expects coords in [-1, 1]
-            grid = pixel_uvs * 2.0 - 1.0  # (1, H, W, 2)
-            rendered = F.grid_sample(
-                atlas_texture.permute(0, 3, 1, 2),  # (1, 3, H_atlas, W_atlas)
-                grid,
-                mode='bilinear',
-                align_corners=True,
-                padding_mode='border',
-            )  # (1, 3, render_size, render_size)
-            rendered = rendered.permute(0, 2, 3, 1)  # (1, H, W, 3)
-
-            # Resize GT keyframe to render_size
-            gt_np = kf["pixels"]  # (H_orig, W_orig, 3)
-            gt_resized = _resize_image(gt_np, render_size, render_size)
-            gt = torch.from_numpy(gt_resized).float().unsqueeze(0).to(device)
-
-            # Photometric loss (only on valid pixels)
-            valid_3d = valid_mask.unsqueeze(-1).float()  # (1, H, W, 1)
-            photo_loss = (torch.abs(rendered - gt) * valid_3d).sum() / (valid_3d.sum() * 3 + 1e-6)
-            total_loss = total_loss + photo_loss
-
-        total_loss = total_loss / kf_per_step
-
-        # Total variation regularization on atlas
-        if tv_weight > 0:
-            tv_h = torch.abs(atlas_texture[:, 1:, :, :] - atlas_texture[:, :-1, :, :]).mean()
-            tv_w = torch.abs(atlas_texture[:, :, 1:, :] - atlas_texture[:, :, :-1, :]).mean()
-            total_loss = total_loss + tv_weight * (tv_h + tv_w)
-
-        total_loss.backward()
-        optimizer.step()
-
-        with torch.no_grad():
-            atlas_texture.data.clamp_(0, 1)
-
-        if step % 50 == 0 or step == num_steps - 1:
-            logger.info(f"Step {step}/{num_steps}, loss={total_loss.item():.6f}")
+        if kf_idx % 50 == 0:
+            filled_count = np.sum(topk_scores[:, 0] > 0)
+            logger.info(f"Multi-view blend: {kf_idx + 1}/{n_kf} keyframes, "
+                        f"{filled_count}/{n_filled} texels have ≥1 view")
             if progress_fn:
-                progress_fn(step, num_steps, total_loss.item())
+                progress_fn(kf_idx, n_kf, 0.0)
 
-    result = atlas_texture.detach().squeeze(0).cpu().numpy()
-    return result
+    # Weighted blend: softmax over scores for smooth weighting
+    valid_mask = topk_scores > 0
+    topk_scores_safe = np.where(valid_mask, topk_scores, -1e9)
+
+    # Softmax-like weighting with temperature for sharpness control
+    temperature = 0.3
+    exp_scores = np.exp((topk_scores_safe - topk_scores_safe.max(axis=1, keepdims=True))
+                        / temperature)
+    exp_scores = np.where(valid_mask, exp_scores, 0.0)
+    weight_sum = exp_scores.sum(axis=1, keepdims=True)
+    weights = exp_scores / np.maximum(weight_sum, 1e-8)  # (N, K)
+
+    blended = (topk_colors * weights[:, :, None]).sum(axis=1)  # (N, 3)
+
+    atlas = np.zeros((texel_count, 3), dtype=np.float32)
+    has_any = topk_scores[:, 0] > 0
+    atlas[filled_idx[has_any]] = blended[has_any]
+
+    logger.info(f"Multi-view blend complete: {has_any.sum()}/{n_filled} texels filled, "
+                f"top_k={top_k}, temperature={temperature}")
+
+    if progress_fn:
+        progress_fn(n_kf, n_kf, 0.0)
+
+    return atlas.reshape(atlas_h, atlas_w, 3)
 
 
 def _resize_image(img: np.ndarray, h: int, w: int) -> np.ndarray:
@@ -632,15 +579,9 @@ def refine_texture(run_dir: Path, num_steps: int = 300,
     prerastd = _prerasterize_atlas(mesh)
     logger.info(f"Pre-rasterization done in {time.time() - t0:.1f}s")
 
-    if _check_pytorch3d():
-        atlas_float = _refine_pytorch3d(mesh, keyframes, num_steps,
-                                         progress_fn=progress_fn)
-    else:
-        atlas_float = _refine_fallback(mesh, keyframes, num_steps,
-                                        prerastd=prerastd,
-                                        progress_fn=progress_fn)
-        if progress_fn:
-            progress_fn(num_steps, num_steps, 0.0)
+    atlas_float = _refine_multiview_blend(mesh, keyframes, top_k=5,
+                                           prerastd=prerastd,
+                                           progress_fn=progress_fn)
 
     atlas_uint8 = (np.clip(atlas_float, 0, 1) * 255).astype(np.uint8)
 
