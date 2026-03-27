@@ -1,12 +1,17 @@
 # RoomScan-GaussianSplatServer
 
-PC training server + web dashboard for [QuestRoomScan](https://github.com/arghyasur1991/QuestRoomScan) Gaussian Splatting pipeline, with experimental HQ texture refinement via differentiable rendering.
+PC training server + web dashboard for [QuestRoomScan](https://github.com/arghyasur1991/QuestRoomScan) Gaussian Splatting pipeline, with server-side atlas enhancement and mesh enhancement.
 
 ## Overview
 
 Receives captured keyframes and point cloud from a Meta Quest headset, runs COLMAP conversion + Gaussian Splat training, and serves the trained model back. Includes a real-time web dashboard for monitoring training, browsing keyframes, and interactively viewing point clouds and trained splats.
 
-Also provides an experimental **texture refinement API** (`/refine-texture`) that accepts a UV-unwrapped mesh + keyframes and optimizes a texture atlas via differentiable rendering (PyTorch, supports MPS/CUDA/CPU). **Note: this feature is currently broken** — the output atlas does not correctly correspond to room textures. On-device refinement in QuestRoomScan is the recommended path.
+Additionally provides:
+
+- **Atlas Enhancement API** (`/enhance-atlas`) — Takes a refined texture atlas PNG, applies Real-ESRGAN super-resolution (2x/4x) + LaMa inpainting, and returns the enhanced atlas. Used by QuestRoomScan's HQ Refine feature.
+- **Mesh Enhancement API** (`/enhance-mesh`) — Takes a binary mesh (Unity's refined mesh format), applies bilateral normal-guided smoothing + optional RANSAC plane detection and vertex snapping, and returns the enhanced mesh.
+- **Atlas Inpainting API** (`/inpaint-atlas`) — Standalone endpoint for LaMa/OpenCV inpainting of atlas textures.
+- **Texture Refinement API** (`/refine-texture`) — Experimental multi-view texture optimization via PyTorch (MPS/CUDA/CPU). Superseded by on-device refinement in QuestRoomScan.
 
 ![Web Dashboard](docs/gs-webapp.png)
 
@@ -66,6 +71,9 @@ GaussianSplatPlyLoader                          GET /api/keyframes ───► 
       │                                         GET /api/pointcloud ──► PointCloudViewer
       ▼                                         GET /api/splat ───────► SplatViewer
 GaussianSplatRenderer (UGS)
+
+RoomScanner ──POST /enhance-atlas──► atlas_enhance.py (Real-ESRGAN SR → LaMa inpaint)
+           ──POST /enhance-mesh───► mesh_enhance.py (bilateral smooth → plane snap)
 ```
 
 ### Stack
@@ -74,6 +82,8 @@ GaussianSplatRenderer (UGS)
 - **Frontend**: React 19 + Vite + TypeScript + Tailwind CSS
 - **3D Rendering**: Three.js / @react-three/fiber (point cloud) + @mkkellogg/gaussian-splats-3d (trained splat)
 - **Training**: msplat (Metal/Apple Silicon), gsplat (CUDA), or original 3DGS
+- **Atlas Enhancement**: Real-ESRGAN (super-resolution), LaMa (inpainting), OpenCV (fallback)
+- **Mesh Enhancement**: NumPy/SciPy (bilateral normal filter, RANSAC plane detection)
 
 ## API Reference
 
@@ -88,11 +98,19 @@ These are called by the Quest app's `GSplatServerClient`:
 | `GET` | `/download` | Download trained `splat.ply` (denormalized to world coordinates) |
 | `POST` | `/cancel` | Cancel in-progress training |
 
-### Texture Refinement Endpoints (experimental — currently broken)
+### Atlas & Mesh Enhancement Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/refine-texture?steps=N` | Upload ZIP of UV mesh + keyframes; starts async differentiable texture optimization |
+| `POST` | `/enhance-atlas?scale=2&inpaint=true` | Upload atlas PNG; returns SR-enhanced + inpainted atlas PNG. `scale`: 2 or 4 (Real-ESRGAN). `inpaint`: apply LaMa after SR. |
+| `POST` | `/enhance-mesh` | Upload binary mesh (Unity format); returns enhanced mesh with bilateral smoothing + plane snapping |
+| `POST` | `/inpaint-atlas` | Upload atlas PNG; returns inpainted atlas (LaMa or OpenCV fallback) |
+
+### Texture Refinement Endpoints (experimental)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/refine-texture?steps=N` | Upload ZIP of UV mesh + keyframes; starts async multi-view texture optimization |
 | `GET` | `/refine-texture/status` | Poll refinement progress (`{state, progress, message}`) |
 | `GET` | `/refine-texture/result` | Download the optimized atlas PNG when refinement is done |
 
