@@ -9,3 +9,5 @@ Pillow
 realesrgan
 basicsr
 pytorch3d
+lama-cleaner
+opencv-python-headless

@@ -670,6 +670,18 @@ def refine_texture(run_dir: Path, num_steps: int = 300,
     atlas_uint8 = (np.clip(atlas_float, 0, 1) * 255).astype(np.uint8)
 
     from PIL import Image
+
+    # Inpainting pass: fill any remaining gaps in the atlas
+    try:
+        from atlas_inpaint import _detect_gaps, _inpaint_lama, _inpaint_opencv
+        gap_mask = _detect_gaps(atlas_uint8)
+        if np.sum(gap_mask > 0) > 0:
+            logger.info("Running inpainting on atlas gaps...")
+            atlas_uint8 = _inpaint_lama(atlas_uint8, gap_mask)
+            logger.info("Inpainting complete")
+    except Exception as e:
+        logger.warning(f"Inpainting skipped: {e}")
+
     img = Image.fromarray(atlas_uint8, "RGB")
     out_path = run_dir / "hq_atlas.png"
     img.save(out_path, "PNG")

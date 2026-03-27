@@ -113,6 +113,48 @@ async def enhance_mesh_endpoint(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Atlas Inpainting API
+# ═══════════════════════════════════════════════════════════════════════
+
+INPAINT_DIR = WORK_DIR / "inpaint_runs"
+INPAINT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/inpaint-atlas")
+async def inpaint_atlas_endpoint(request: Request, method: str = "auto"):
+    """Upload an atlas PNG with gaps, return inpainted version."""
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    import logging
+    from datetime import datetime
+    logger = logging.getLogger("atlas_inpaint")
+
+    try:
+        from atlas_inpaint import inpaint_atlas
+
+        name = datetime.now().strftime("inpaint_%Y%m%d_%H%M%S")
+        run_dir = INPAINT_DIR / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = run_dir / "atlas_input.png"
+        input_path.write_bytes(body)
+
+        output_path = inpaint_atlas(input_path, method=method)
+
+        return FileResponse(
+            path=output_path,
+            media_type="image/png",
+            filename="atlas_inpainted.png",
+        )
+
+    except Exception as e:
+        logger.exception("Atlas inpainting failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Texture Refinement API
 # ═══════════════════════════════════════════════════════════════════════
 
