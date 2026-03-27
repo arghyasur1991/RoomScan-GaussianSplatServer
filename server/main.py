@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import threading
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -53,10 +56,106 @@ app.add_middleware(NoCacheAPIMiddleware)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Texture Refinement API
+#  Mesh Enhancement API
 # ═══════════════════════════════════════════════════════════════════════
 
-import threading
+MESH_ENHANCE_DIR = WORK_DIR / "mesh_enhance_runs"
+MESH_ENHANCE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/enhance-mesh")
+async def enhance_mesh_endpoint(
+    request: Request,
+    smooth_iterations: int = 5,
+    smooth_method: str = "bilateral",
+    enable_plane_snap: bool = True,
+    plane_threshold: float = 0.02,
+    snap_threshold: float = 0.03,
+    max_planes: int = 10,
+):
+    """Upload refined_mesh.bin, return enhanced version with smoothing + plane snapping."""
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    logger = logging.getLogger("mesh_enhance")
+
+    try:
+        from mesh_enhance import enhance_mesh
+
+        name = datetime.now().strftime("meshenhance_%Y%m%d_%H%M%S")
+        run_dir = MESH_ENHANCE_DIR / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = run_dir / "refined_mesh.bin"
+        input_path.write_bytes(body)
+        logger.info(f"Received mesh ({len(body)} bytes)")
+
+        output_path = enhance_mesh(
+            input_path,
+            output_path=run_dir / "enhanced_mesh.bin",
+            smooth_iterations=smooth_iterations,
+            smooth_method=smooth_method,
+            enable_plane_snap=enable_plane_snap,
+            plane_threshold=plane_threshold,
+            plane_snap_threshold=snap_threshold,
+            max_planes=max_planes,
+        )
+
+        return FileResponse(
+            path=output_path,
+            media_type="application/octet-stream",
+            filename="enhanced_mesh.bin",
+        )
+
+    except Exception as e:
+        logger.exception("Mesh enhancement failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Atlas Inpainting API
+# ═══════════════════════════════════════════════════════════════════════
+
+INPAINT_DIR = WORK_DIR / "inpaint_runs"
+INPAINT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/inpaint-atlas")
+async def inpaint_atlas_endpoint(request: Request, method: str = "auto"):
+    """Upload an atlas PNG with gaps, return inpainted version."""
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    logger = logging.getLogger("atlas_inpaint")
+
+    try:
+        from atlas_inpaint import inpaint_atlas
+
+        name = datetime.now().strftime("inpaint_%Y%m%d_%H%M%S")
+        run_dir = INPAINT_DIR / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = run_dir / "atlas_input.png"
+        input_path.write_bytes(body)
+
+        output_path = inpaint_atlas(input_path, method=method)
+
+        return FileResponse(
+            path=output_path,
+            media_type="image/png",
+            filename="atlas_inpainted.png",
+        )
+
+    except Exception as e:
+        logger.exception("Atlas inpainting failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Texture Refinement API
+# ═══════════════════════════════════════════════════════════════════════
 
 REFINE_DIR = WORK_DIR / "refine_runs"
 REFINE_DIR.mkdir(parents=True, exist_ok=True)
@@ -74,7 +173,6 @@ _refine_thread: threading.Thread | None = None
 
 
 def _run_refine_thread(run_dir: Path, num_steps: int):
-    import logging
     from texture_refine import refine_texture as do_refine
     logger = logging.getLogger("texture_refine")
 
@@ -117,8 +215,7 @@ async def refine_texture_start(request: Request, steps: int | None = None):
     if len(body) == 0:
         return JSONResponse(status_code=400, content={"error": "Empty body"})
 
-    import zipfile, io, shutil, logging
-    from datetime import datetime
+    import zipfile, io, shutil
     logger = logging.getLogger("texture_refine")
 
     try:
@@ -186,6 +283,51 @@ async def refine_texture_result():
         return JSONResponse(status_code=404, content={"error": "Output file not found"})
 
     return FileResponse(path=out_path, media_type="image/png", filename="hq_atlas.png")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Atlas Enhancement API (super-resolution)
+# ═══════════════════════════════════════════════════════════════════════
+
+ENHANCE_DIR = WORK_DIR / "enhance_runs"
+ENHANCE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/enhance-atlas")
+async def enhance_atlas_endpoint(request: Request, scale: int = 2, inpaint: bool = True):
+    """Upload a PNG atlas, return the SR-upscaled (and optionally inpainted) version."""
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    logger = logging.getLogger("atlas_enhance")
+
+    try:
+        from atlas_enhance import enhance_atlas as do_enhance
+
+        name = datetime.now().strftime("enhance_%Y%m%d_%H%M%S")
+        run_dir = ENHANCE_DIR / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = run_dir / "atlas_input.png"
+        input_path.write_bytes(body)
+        logger.info(f"Received atlas ({len(body)} bytes), scale={scale}, inpaint={inpaint}")
+
+        output_path = run_dir / "atlas_enhanced.png"
+        do_enhance(input_path, output_path, scale=scale, inpaint=inpaint)
+
+        return FileResponse(
+            path=output_path,
+            media_type="image/png",
+            filename="atlas_enhanced.png",
+        )
+
+    except ImportError as e:
+        logger.error(f"Missing dependency: {e}")
+        return JSONResponse(status_code=501, content={"error": str(e)})
+    except Exception as e:
+        logger.exception("Atlas enhancement failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -358,7 +500,6 @@ async def api_render_image(filename: str):
         return JSONResponse(status_code=404, content={"error": "Render not found"})
     media = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
     return FileResponse(path=path, media_type=media)
-
 
 
 @app.api_route("/api/splat", methods=["GET", "HEAD"])

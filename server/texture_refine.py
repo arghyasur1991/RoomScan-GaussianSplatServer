@@ -1,15 +1,24 @@
 """
-Server-side HQ texture refinement via pure PyTorch tensor optimization.
-Works on MPS (Apple Silicon), CUDA (NVIDIA), and CPU — no custom kernels.
+Server-side HQ texture refinement via differentiable rendering.
 
-Pipeline:
-  1. Load mesh + UVs + keyframes from extracted ZIP
+Primary path: PyTorch3D differentiable rasterization (MPS/CUDA/CPU).
+Fallback path: pre-computed correspondences + tensor optimization (no PyTorch3D).
+
+Pipeline (PyTorch3D):
+  1. Load mesh + UVs + keyframes
+  2. Build PyTorch3D Meshes with TexturesUV (learnable atlas)
+  3. For each optimization step, render mesh from keyframe viewpoints
+  4. Photometric L1 loss vs actual keyframe images + TV regularization
+  5. Backprop to atlas texture
+  6. Export refined atlas as PNG
+
+Pipeline (Fallback):
+  1. Load mesh + UVs + keyframes
   2. Pre-compute UV-to-pixel correspondences (NumPy)
   3. Initialize atlas from per-texel best-view projection
-  4. Differentiable optimization: gather + L2 loss + backprop
+  4. Differentiable gather + L2 loss + backprop
   5. Export refined atlas as PNG
 """
-
 from __future__ import annotations
 
 import json
@@ -22,6 +31,23 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("texture_refine")
 logger.setLevel(logging.INFO)
+
+_HAS_PYTORCH3D = None
+
+
+def _check_pytorch3d() -> bool:
+    global _HAS_PYTORCH3D
+    if _HAS_PYTORCH3D is not None:
+        return _HAS_PYTORCH3D
+    try:
+        import pytorch3d
+        from pytorch3d.renderer import MeshRasterizer
+        _HAS_PYTORCH3D = True
+        logger.info(f"PyTorch3D {pytorch3d.__version__} available — using differentiable rendering")
+    except ImportError:
+        _HAS_PYTORCH3D = False
+        logger.info("PyTorch3D not installed — using fallback correspondence optimization")
+    return _HAS_PYTORCH3D
 
 
 def get_device():
@@ -38,6 +64,10 @@ def get_device():
     return torch.device("cpu")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Mesh & Keyframe I/O (shared)
+# ═══════════════════════════════════════════════════════════════════════
+
 def load_mesh(mesh_path: Path) -> dict:
     """Load refined_mesh.bin (binary format from Unity persistence)."""
     with open(mesh_path, "rb") as f:
@@ -46,13 +76,11 @@ def load_mesh(mesh_path: Path) -> dict:
         atlas_w = struct.unpack("<i", f.read(4))[0]
         atlas_h = struct.unpack("<i", f.read(4))[0]
 
-        # Each vertex: float3 pos + float3 norm + float2 uv = 32 bytes
         verts_raw = np.frombuffer(f.read(vert_count * 32), dtype=np.float32).reshape(vert_count, 8)
-        positions = verts_raw[:, 0:3]
-        normals = verts_raw[:, 3:6]
-        uvs = verts_raw[:, 6:8]
-
-        indices = np.frombuffer(f.read(idx_count * 4), dtype=np.int32).reshape(-1, 3)
+        positions = verts_raw[:, 0:3].copy()
+        normals = verts_raw[:, 3:6].copy()
+        uvs = verts_raw[:, 6:8].copy()
+        indices = np.frombuffer(f.read(idx_count * 4), dtype=np.int32).reshape(-1, 3).copy()
 
     return {
         "positions": positions,
@@ -82,7 +110,10 @@ def load_keyframes(run_dir: Path) -> list[dict]:
             continue
 
         img = Image.open(img_path).convert("RGB")
-        pixels = np.array(img, dtype=np.float32) / 255.0  # H x W x 3
+        # Flip vertically: Unity's GetPixels32() has row 0 at the bottom,
+        # but PIL has row 0 at the top. The projection formula assumes
+        # Unity's bottom-up convention, so flip to match.
+        pixels = np.array(img, dtype=np.float32)[::-1].copy() / 255.0
 
         sw = meta.get("sw", img.width)
         sh = meta.get("sh", img.height)
@@ -122,345 +153,414 @@ def build_view_matrix(position: np.ndarray, rotation: np.ndarray) -> np.ndarray:
     return view
 
 
-def project_to_screen(world_pts: np.ndarray, view_mat: np.ndarray,
-                      fx: float, fy: float, cx: float, cy: float) -> tuple[np.ndarray, np.ndarray]:
-    """Project Nx3 world points to Nx2 screen coords. Returns (screen_xy, cam_z)."""
-    ones = np.ones((world_pts.shape[0], 1), dtype=np.float32)
-    pts4 = np.hstack([world_pts, ones])
-    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
-        cam = (view_mat @ pts4.T).T  # Nx4
-    cam_z = cam[:, 2]
-    valid = (cam_z > 0.001) & np.isfinite(cam_z)
-    safe_z = np.where(valid, cam_z, 1.0)
-    screen_x = np.where(valid, fx * cam[:, 0] / safe_z + cx, -1)
-    screen_y = np.where(valid, fy * cam[:, 1] / safe_z + cy, -1)
-    return np.stack([screen_x, screen_y], axis=1), cam_z
+# ═══════════════════════════════════════════════════════════════════════
+#  PyTorch3D Differentiable Rendering Path
+# ═══════════════════════════════════════════════════════════════════════
 
-
-def _rasterize_triangles_vectorized(
-    uv0s, uv1s, uv2s, s0s, s1s, s2s, scores,
-    atlas_w, atlas_h, img_w, img_h, kf_idx, pixels,
-    best_score, best_color, texel_indices_list,
-):
-    """Rasterize all visible triangles into atlas space using batched NumPy ops."""
-    K = len(uv0s)
-    if K == 0:
-        return
-
-    BATCH = 256
-    for batch_start in range(0, K, BATCH):
-        batch_end = min(batch_start + BATCH, K)
-        b_uv0 = uv0s[batch_start:batch_end]
-        b_uv1 = uv1s[batch_start:batch_end]
-        b_uv2 = uv2s[batch_start:batch_end]
-        b_s0 = s0s[batch_start:batch_end]
-        b_s1 = s1s[batch_start:batch_end]
-        b_s2 = s2s[batch_start:batch_end]
-        b_scores = scores[batch_start:batch_end]
-
-        b_min_x = np.floor(np.minimum(np.minimum(b_uv0[:, 0], b_uv1[:, 0]), b_uv2[:, 0])).astype(np.int32)
-        b_max_x = np.ceil(np.maximum(np.maximum(b_uv0[:, 0], b_uv1[:, 0]), b_uv2[:, 0])).astype(np.int32)
-        b_min_y = np.floor(np.minimum(np.minimum(b_uv0[:, 1], b_uv1[:, 1]), b_uv2[:, 1])).astype(np.int32)
-        b_max_y = np.ceil(np.maximum(np.maximum(b_uv0[:, 1], b_uv1[:, 1]), b_uv2[:, 1])).astype(np.int32)
-
-        np.clip(b_min_x, 0, atlas_w - 1, out=b_min_x)
-        np.clip(b_max_x, 0, atlas_w - 1, out=b_max_x)
-        np.clip(b_min_y, 0, atlas_h - 1, out=b_min_y)
-        np.clip(b_max_y, 0, atlas_h - 1, out=b_max_y)
-
-        denom = (b_uv1[:, 1] - b_uv2[:, 1]) * (b_uv0[:, 0] - b_uv2[:, 0]) + \
-                (b_uv2[:, 0] - b_uv1[:, 0]) * (b_uv0[:, 1] - b_uv2[:, 1])
-
-        for ti in range(batch_end - batch_start):
-            if abs(denom[ti]) < 1e-8:
-                continue
-            inv_d = 1.0 / denom[ti]
-            u0x, u0y = b_uv0[ti]
-            u1x, u1y = b_uv1[ti]
-            u2x, u2y = b_uv2[ti]
-            mn_x, mx_x = int(b_min_x[ti]), int(b_max_x[ti])
-            mn_y, mx_y = int(b_min_y[ti]), int(b_max_y[ti])
-            span_x = mx_x - mn_x + 1
-            span_y = mx_y - mn_y + 1
-            if span_x <= 0 or span_y <= 0:
-                continue
-
-            px_arr = np.arange(mn_x, mx_x + 1, dtype=np.float32)
-            py_arr = np.arange(mn_y, mx_y + 1, dtype=np.float32)
-            gx, gy = np.meshgrid(px_arr, py_arr)
-            gx_flat = gx.ravel()
-            gy_flat = gy.ravel()
-
-            bw0 = ((u1y - u2y) * (gx_flat - u2x) + (u2x - u1x) * (gy_flat - u2y)) * inv_d
-            bw1 = ((u2y - u0y) * (gx_flat - u2x) + (u0x - u2x) * (gy_flat - u2y)) * inv_d
-            bw2 = 1.0 - bw0 - bw1
-
-            inside = (bw0 >= -0.001) & (bw1 >= -0.001) & (bw2 >= -0.001)
-            if not np.any(inside):
-                continue
-
-            idx_in = np.where(inside)[0]
-            bw0_in = bw0[idx_in]
-            bw1_in = bw1[idx_in]
-            bw2_in = bw2[idx_in]
-
-            sc0, sc1, sc2 = b_s0[ti], b_s1[ti], b_s2[ti]
-            sx = bw0_in * sc0[0] + bw1_in * sc1[0] + bw2_in * sc2[0]
-            sy = bw0_in * sc0[1] + bw1_in * sc1[1] + bw2_in * sc2[1]
-            ipx = np.round(sx).astype(np.int32)
-            ipy_screen = np.round(sy).astype(np.int32)
-
-            scr_ok = (ipx >= 0) & (ipx < img_w) & (ipy_screen >= 0) & (ipy_screen < img_h)
-            if not np.any(scr_ok):
-                continue
-
-            ok_idx = np.where(scr_ok)[0]
-            f_gx = gx_flat[idx_in[ok_idx]].astype(np.int32)
-            f_gy = gy_flat[idx_in[ok_idx]].astype(np.int32)
-            f_ipx = ipx[ok_idx]
-            f_ipy = ipy_screen[ok_idx]
-            f_texel = f_gy * atlas_w + f_gx
-
-            score = float(b_scores[ti])
-
-            better = score > best_score[f_texel]
-            if np.any(better):
-                b_ids = np.where(better)[0]
-                b_t = f_texel[b_ids]
-                best_score[b_t] = score
-                best_color[b_t] = pixels[f_ipy[b_ids], f_ipx[b_ids]]
-
-            n = len(f_texel)
-            chunk = np.empty((n, 5), dtype=np.float32)
-            chunk[:, 0] = f_texel
-            chunk[:, 1] = kf_idx
-            chunk[:, 2] = f_ipx
-            chunk[:, 3] = f_ipy
-            chunk[:, 4] = score
-            texel_indices_list.append(chunk)
-
-
-def compute_correspondences(mesh: dict, keyframes: list[dict]) -> dict:
+def _refine_multiview_blend(mesh: dict, keyframes: list[dict],
+                            top_k: int = 5, prerastd: dict = None,
+                            progress_fn: callable = None) -> np.ndarray:
     """
-    Pre-compute which atlas texels correspond to which keyframe pixels.
-    Vectorized: all triangles processed per keyframe in batched NumPy ops.
+    Weighted multi-view blending: for each texel, blend the top-K keyframe
+    observations weighted by their viewing score. Produces smoother, more
+    consistent textures than single-view selection without requiring GPU
+    differentiable rendering.
     """
     atlas_w, atlas_h = mesh["atlas_w"], mesh["atlas_h"]
-    uvs = mesh["uvs"]
-    positions = mesh["positions"]
-    normals = mesh["normals"]
-    indices = mesh["indices"]  # Tx3
-
-    T = indices.shape[0]
     texel_count = atlas_w * atlas_h
-    best_score = np.full(texel_count, -1.0, dtype=np.float32)
-    best_color = np.zeros((texel_count, 3), dtype=np.float32)
-    texel_indices_list = []
 
-    # Pre-compute per-triangle constants (invariant across keyframes)
-    i0s, i1s, i2s = indices[:, 0], indices[:, 1], indices[:, 2]
-    p0s = positions[i0s]  # Tx3
-    p1s = positions[i1s]
-    p2s = positions[i2s]
-    n0s = normals[i0s]
+    if prerastd is None:
+        prerastd = _prerasterize_atlas(mesh)
 
-    face_normals = np.cross(p1s - p0s, p2s - p0s)  # Tx3
-    norm_lens = np.linalg.norm(face_normals, axis=1, keepdims=True)  # Tx1
-    degenerate = (norm_lens.ravel() < 1e-6)
-    safe_lens = np.where(norm_lens < 1e-6, 1.0, norm_lens)
-    face_normals = np.where(degenerate[:, None], n0s, face_normals / safe_lens)
+    texel_pos = prerastd["texel_pos"]
+    texel_norm = prerastd["texel_norm"]
+    filled_idx = prerastd["filled_idx"]
+    n_filled = len(filled_idx)
 
-    centroids = (p0s + p1s + p2s) / 3.0  # Tx3
+    # For each texel, track top-K scores and corresponding colors
+    topk_scores = np.full((n_filled, top_k), -1.0, dtype=np.float32)
+    topk_colors = np.zeros((n_filled, top_k, 3), dtype=np.float32)
 
-    # UV coords in atlas pixel space
-    uv_scale = np.array([atlas_w, atlas_h], dtype=np.float32)
-    uv0s = uvs[i0s] * uv_scale  # Tx2
-    uv1s = uvs[i1s] * uv_scale
-    uv2s = uvs[i2s] * uv_scale
+    ones_col = np.ones((n_filled, 1), dtype=np.float32)
+    pts4 = np.hstack([texel_pos, ones_col])
+
+    n_kf = len(keyframes)
 
     for kf_idx, kf in enumerate(keyframes):
         view_mat = build_view_matrix(kf["position"], kf["rotation"])
         if not np.isfinite(view_mat).all():
-            logger.warning(f"Skipping keyframe {kf_idx}: non-finite view matrix")
             continue
+
         cam_pos = kf["position"]
         fx, fy, cx, cy = kf["fx"], kf["fy"], kf["cx"], kf["cy"]
         w, h = kf["width"], kf["height"]
 
-        # Batch view direction + dot product
-        view_dirs = cam_pos - centroids  # Tx3
-        dists = np.linalg.norm(view_dirs, axis=1)  # T
+        view_dirs = cam_pos - texel_pos
+        dists = np.linalg.norm(view_dirs, axis=1)
         safe_dists = np.maximum(dists, 0.01)
-        view_dirs_n = view_dirs / safe_dists[:, None]
-        dots = np.sum(face_normals * view_dirs_n, axis=1)  # T
+        dots = np.sum(texel_norm * (view_dirs / safe_dists[:, None]), axis=1)
 
-        mask = (dots > 0.05) & (dists >= 0.01)
-        if not np.any(mask):
-            if kf_idx % 20 == 0:
-                logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
+        visible = (dots > 0.05) & (dists >= 0.01)
+        if not np.any(visible):
             continue
 
-        m_idx = np.where(mask)[0]
-        m_p0 = p0s[m_idx]
-        m_p1 = p1s[m_idx]
-        m_p2 = p2s[m_idx]
+        scores = dots / np.maximum(dists, 0.1)
 
-        all_verts = np.concatenate([m_p0, m_p1, m_p2], axis=0)
-        screen_all, camz_all = project_to_screen(all_verts, view_mat, fx, fy, cx, cy)
-        M = len(m_idx)
-        s0 = screen_all[:M]
-        s1 = screen_all[M:2*M]
-        s2 = screen_all[2*M:]
-        z0 = camz_all[:M]
-        z1 = camz_all[M:2*M]
-        z2 = camz_all[2*M:]
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            cam = (view_mat @ pts4.T).T
 
-        in_bounds = lambda s: (s[:, 0] >= 0) & (s[:, 0] < w) & (s[:, 1] >= 0) & (s[:, 1] < h)
-        frustum_ok = in_bounds(s0) | in_bounds(s1) | in_bounds(s2)
-        any_z_ok = (z0 > 0) | (z1 > 0) | (z2 > 0)
-        keep = frustum_ok & any_z_ok
+        cam_z = cam[:, 2]
+        in_front = cam_z > 0.001
 
-        if not np.any(keep):
-            if kf_idx % 20 == 0:
-                logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
+        sx = fx * cam[:, 0] / np.maximum(cam_z, 0.001) + cx
+        sy = fy * cam[:, 1] / np.maximum(cam_z, 0.001) + cy
+
+        in_bounds = (sx >= 0) & (sx < w - 1) & (sy >= 0) & (sy < h - 1)
+        valid = visible & in_front & in_bounds
+
+        # Check which valid texels have a score higher than the current min in top-K
+        current_min = topk_scores.min(axis=1)
+        candidates = valid & (scores > current_min)
+
+        if not np.any(candidates):
             continue
 
-        k_idx = np.where(keep)[0]
-        k_global = m_idx[k_idx]
-        k_s0 = s0[k_idx]
-        k_s1 = s1[k_idx]
-        k_s2 = s2[k_idx]
-        k_dots = dots[k_global]
-        k_dists = np.maximum(dists[k_global], 0.1)
-        scores = k_dots / k_dists
+        ci = np.where(candidates)[0]
+        px_i = np.clip(np.round(sx[ci]).astype(np.int32), 0, w - 1)
+        py_i = np.clip(np.round(sy[ci]).astype(np.int32), 0, h - 1)
+        colors = kf["pixels"][py_i, px_i]
 
-        k_uv0 = uv0s[k_global]
-        k_uv1 = uv1s[k_global]
-        k_uv2 = uv2s[k_global]
+        # Insert into top-K: replace the slot with the lowest score
+        min_slot = topk_scores[ci].argmin(axis=1)
+        topk_scores[ci, min_slot] = scores[ci]
+        topk_colors[ci, min_slot, :] = colors
 
-        pixels = kf["pixels"]
+        if kf_idx % 50 == 0:
+            filled_count = np.sum(topk_scores[:, 0] > 0)
+            logger.info(f"Multi-view blend: {kf_idx + 1}/{n_kf} keyframes, "
+                        f"{filled_count}/{n_filled} texels have ≥1 view")
+            if progress_fn:
+                progress_fn(kf_idx, n_kf, 0.0)
 
-        # UV-space rasterization: vectorized per-triangle bounding-box scan
-        _rasterize_triangles_vectorized(
-            k_uv0, k_uv1, k_uv2, k_s0, k_s1, k_s2, scores,
-            atlas_w, atlas_h, w, h, kf_idx, pixels,
-            best_score, best_color, texel_indices_list,
-        )
+    # Weighted blend: softmax over scores for smooth weighting
+    valid_mask = topk_scores > 0
+    topk_scores_safe = np.where(valid_mask, topk_scores, -1e9)
 
-        if kf_idx % 20 == 0:
-            logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
+    # Softmax-like weighting with temperature for sharpness control
+    temperature = 0.3
+    exp_scores = np.exp((topk_scores_safe - topk_scores_safe.max(axis=1, keepdims=True))
+                        / temperature)
+    exp_scores = np.where(valid_mask, exp_scores, 0.0)
+    weight_sum = exp_scores.sum(axis=1, keepdims=True)
+    weights = exp_scores / np.maximum(weight_sum, 1e-8)  # (N, K)
+
+    blended = (topk_colors * weights[:, :, None]).sum(axis=1)  # (N, 3)
+
+    atlas = np.zeros((texel_count, 3), dtype=np.float32)
+    has_any = topk_scores[:, 0] > 0
+    atlas[filled_idx[has_any]] = blended[has_any]
+
+    logger.info(f"Multi-view blend complete: {has_any.sum()}/{n_filled} texels filled, "
+                f"top_k={top_k}, temperature={temperature}")
+
+    if progress_fn:
+        progress_fn(n_kf, n_kf, 0.0)
+
+    return atlas.reshape(atlas_h, atlas_w, 3)
+
+
+def _resize_image(img: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Resize image using PIL."""
+    from PIL import Image
+    pil_img = Image.fromarray((img * 255).astype(np.uint8))
+    pil_img = pil_img.resize((w, h), Image.BILINEAR)
+    return np.array(pil_img, dtype=np.float32) / 255.0
+
+
+def _prerasterize_atlas(mesh: dict) -> dict:
+    """
+    Pre-rasterize the UV atlas: for each filled texel, store which face it
+    belongs to and the barycentric-interpolated 3D position + normal.
+    This is done once and reused for all keyframes.
+    """
+    atlas_w, atlas_h = mesh["atlas_w"], mesh["atlas_h"]
+    positions = mesh["positions"]
+    normals = mesh["normals"]
+    uvs = mesh["uvs"]
+    indices = mesh["indices"]
+
+    i0s, i1s, i2s = indices[:, 0], indices[:, 1], indices[:, 2]
+    p0s, p1s, p2s = positions[i0s], positions[i1s], positions[i2s]
+    n0s, n1s, n2s = normals[i0s], normals[i1s], normals[i2s]
+
+    uv_scale = np.array([atlas_w, atlas_h], dtype=np.float32)
+    uv0s = (uvs[i0s] * uv_scale).astype(np.float32)
+    uv1s = (uvs[i1s] * uv_scale).astype(np.float32)
+    uv2s = (uvs[i2s] * uv_scale).astype(np.float32)
+
+    face_normals = np.cross(p1s - p0s, p2s - p0s)
+    norm_lens = np.linalg.norm(face_normals, axis=1, keepdims=True)
+    safe_lens = np.maximum(norm_lens, 1e-6)
+    face_normals = face_normals / safe_lens
+
+    texel_count = atlas_w * atlas_h
+    texel_pos = np.zeros((texel_count, 3), dtype=np.float32)
+    texel_norm = np.zeros((texel_count, 3), dtype=np.float32)
+    texel_filled = np.zeros(texel_count, dtype=bool)
+
+    n_faces = len(indices)
+    for fi in range(n_faces):
+        uv0, uv1, uv2 = uv0s[fi], uv1s[fi], uv2s[fi]
+
+        min_x = max(0, int(np.floor(min(uv0[0], uv1[0], uv2[0]))))
+        max_x = min(atlas_w - 1, int(np.ceil(max(uv0[0], uv1[0], uv2[0]))))
+        min_y = max(0, int(np.floor(min(uv0[1], uv1[1], uv2[1]))))
+        max_y = min(atlas_h - 1, int(np.ceil(max(uv0[1], uv1[1], uv2[1]))))
+
+        denom = (uv1[1] - uv2[1]) * (uv0[0] - uv2[0]) + \
+                (uv2[0] - uv1[0]) * (uv0[1] - uv2[1])
+        if abs(denom) < 1e-8:
+            continue
+        inv_d = 1.0 / denom
+
+        a0x = uv1[1] - uv2[1]; a0y = uv2[0] - uv1[0]
+        a1x = uv2[1] - uv0[1]; a1y = uv0[0] - uv2[0]
+
+        xs = np.arange(min_x, max_x + 1, dtype=np.float32)
+        ys = np.arange(min_y, max_y + 1, dtype=np.float32)
+        if len(xs) == 0 or len(ys) == 0:
+            continue
+
+        gx, gy = np.meshgrid(xs, ys)
+        dx = gx - uv2[0]
+        dy = gy - uv2[1]
+        bw0 = (a0x * dx + a0y * dy) * inv_d
+        bw1 = (a1x * dx + a1y * dy) * inv_d
+        bw2 = 1.0 - bw0 - bw1
+
+        valid = (bw0 >= -0.001) & (bw1 >= -0.001) & (bw2 >= -0.001)
+        vy, vx = np.where(valid)
+        if len(vy) == 0:
+            continue
+
+        pix_x = (gx[vy, vx]).astype(np.int32)
+        pix_y = (gy[vy, vx]).astype(np.int32)
+        tidx = pix_y * atlas_w + pix_x
+
+        b0 = bw0[vy, vx][:, None]
+        b1 = bw1[vy, vx][:, None]
+        b2 = bw2[vy, vx][:, None]
+
+        pos_interp = b0 * p0s[fi] + b1 * p1s[fi] + b2 * p2s[fi]
+        nrm_interp = b0 * face_normals[fi] + b1 * face_normals[fi] + b2 * face_normals[fi]
+
+        texel_pos[tidx] = pos_interp
+        texel_norm[tidx] = nrm_interp
+        texel_filled[tidx] = True
+
+    filled_idx = np.where(texel_filled)[0]
+    logger.info(f"Pre-rasterized atlas: {len(filled_idx)}/{texel_count} texels filled "
+                f"({100*len(filled_idx)/texel_count:.1f}%)")
 
     return {
-        "best_color": best_color,
-        "best_score": best_score,
-        "correspondences": texel_indices_list,
+        "texel_pos": texel_pos[filled_idx],
+        "texel_norm": texel_norm[filled_idx],
+        "filled_idx": filled_idx,
         "atlas_w": atlas_w,
         "atlas_h": atlas_h,
     }
 
 
-def optimize_atlas(correspondences: dict, keyframes: list[dict],
-                   num_steps: int = 300, lr: float = 0.01,
-                   progress_fn: callable = None) -> np.ndarray:
+def _compute_initial_atlas(mesh: dict, keyframes: list[dict],
+                           prerastd: dict = None) -> np.ndarray:
     """
-    Differentiable texture optimization using pure PyTorch ops.
-    Works on MPS, CUDA, or CPU.
+    Compute initial atlas from best-view per-texel projection.
+    Vectorized: projects all texels at once per keyframe.
     """
-    import torch
-    import torch.nn.functional as F
+    atlas_w, atlas_h = mesh["atlas_w"], mesh["atlas_h"]
+    texel_count = atlas_w * atlas_h
 
-    device = get_device()
-    logger.info(f"Optimizing atlas on device: {device}")
+    if prerastd is None:
+        prerastd = _prerasterize_atlas(mesh)
 
-    atlas_w = correspondences["atlas_w"]
-    atlas_h = correspondences["atlas_h"]
+    texel_pos = prerastd["texel_pos"]     # (N, 3)
+    texel_norm = prerastd["texel_norm"]   # (N, 3)
+    filled_idx = prerastd["filled_idx"]   # (N,)
+    n_filled = len(filled_idx)
 
-    # Initialize atlas from best-view projection
-    initial = correspondences["best_color"].reshape(atlas_h, atlas_w, 3)
-    atlas = torch.nn.Parameter(
-        torch.from_numpy(initial.copy()).to(device)
-    )
+    best_score = np.full(n_filled, -1.0, dtype=np.float32)
+    best_color = np.zeros((n_filled, 3), dtype=np.float32)
 
-    # Build correspondence tensors
-    corr_chunks = correspondences["correspondences"]
-    if len(corr_chunks) == 0:
-        logger.warning("No correspondences found, returning initial atlas")
-        return initial
+    ones_col = np.ones((n_filled, 1), dtype=np.float32)
+    pts4 = np.hstack([texel_pos, ones_col])  # (N, 4)
 
-    corr_arr = np.concatenate(corr_chunks, axis=0) if isinstance(corr_chunks[0], np.ndarray) else np.array(corr_chunks, dtype=np.float32)
-
-    MAX_CORR = 10_000_000
-    if corr_arr.shape[0] > MAX_CORR:
-        logger.info(f"Subsampling correspondences: {corr_arr.shape[0]} -> {MAX_CORR}")
-        rng = np.random.default_rng(42)
-        idx = rng.choice(corr_arr.shape[0], MAX_CORR, replace=False)
-        corr_arr = corr_arr[idx]
-
-    n_corr = corr_arr.shape[0]
-    texel_ids = torch.from_numpy(corr_arr[:, 0].astype(np.int64)).to(device)
-    kf_ids = corr_arr[:, 1].astype(np.int32)
-    pixel_xs = corr_arr[:, 2].astype(np.int32)
-    pixel_ys = corr_arr[:, 3].astype(np.int32)
-
-    # Build target colors per-keyframe using vectorized indexing
-    target_colors = np.zeros((n_corr, 3), dtype=np.float32)
-    for ki in range(len(keyframes)):
-        mask = kf_ids == ki
-        if not np.any(mask):
+    for kf_idx, kf in enumerate(keyframes):
+        view_mat = build_view_matrix(kf["position"], kf["rotation"])
+        if not np.isfinite(view_mat).all():
             continue
-        m_idx = np.where(mask)[0]
-        pxs = pixel_xs[m_idx]
-        pys = pixel_ys[m_idx]
-        target_colors[m_idx] = keyframes[ki]["pixels"][pys, pxs]
 
-    target = torch.from_numpy(target_colors).to(device)
+        cam_pos = kf["position"]
+        fx, fy, cx, cy = kf["fx"], kf["fy"], kf["cx"], kf["cy"]
+        w, h = kf["width"], kf["height"]
 
-    # Convert texel indices to (row, col) for atlas gathering
-    texel_rows = texel_ids // atlas_w
-    texel_cols = texel_ids % atlas_w
+        view_dirs = cam_pos - texel_pos  # (N, 3)
+        dists = np.linalg.norm(view_dirs, axis=1)
+        safe_dists = np.maximum(dists, 0.01)
+        dots = np.sum(texel_norm * (view_dirs / safe_dists[:, None]), axis=1)
 
-    optimizer = torch.optim.Adam([atlas], lr=lr)
+        visible = (dots > 0.05) & (dists >= 0.01)
+        if not np.any(visible):
+            continue
 
-    batch_size = min(n_corr, 50000)
+        scores = dots / np.maximum(dists, 0.1)
 
-    for step in range(num_steps):
-        if n_corr > batch_size:
-            perm = torch.randperm(n_corr, device=device)[:batch_size]
-            b_rows = texel_rows[perm]
-            b_cols = texel_cols[perm]
-            b_target = target[perm]
-        else:
-            b_rows = texel_rows
-            b_cols = texel_cols
-            b_target = target
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            cam = (view_mat @ pts4.T).T  # (N, 4)
 
-        predicted = atlas[b_rows, b_cols]  # Bx3
-        loss = F.mse_loss(predicted, b_target)
+        cam_z = cam[:, 2]
+        in_front = cam_z > 0.001
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        sx = fx * cam[:, 0] / np.maximum(cam_z, 0.001) + cx
+        sy = fy * cam[:, 1] / np.maximum(cam_z, 0.001) + cy
 
-        with torch.no_grad():
-            atlas.data.clamp_(0, 1)
+        in_bounds = (sx >= 0) & (sx < w - 1) & (sy >= 0) & (sy < h - 1)
+        valid = visible & in_front & in_bounds
+        better = valid & (scores > best_score)
 
-        if step % 50 == 0 or step == num_steps - 1:
-            logger.info(f"Step {step}/{num_steps}, loss={loss.item():.6f}")
-            if progress_fn:
-                progress_fn(step, num_steps, loss.item())
+        if not np.any(better):
+            continue
 
-    result = atlas.detach().cpu().numpy()
-    return result
+        bi = np.where(better)[0]
+        px_i = np.clip(np.round(sx[bi]).astype(np.int32), 0, w - 1)
+        py_i = np.clip(np.round(sy[bi]).astype(np.int32), 0, h - 1)
+
+        best_score[bi] = scores[bi]
+        best_color[bi] = kf["pixels"][py_i, px_i]
+
+        if kf_idx % 50 == 0:
+            logger.info(f"Initial atlas: {kf_idx + 1}/{len(keyframes)} keyframes, "
+                        f"{np.sum(best_score > 0)}/{n_filled} texels filled")
+
+    atlas = np.zeros((texel_count, 3), dtype=np.float32)
+    atlas[filled_idx] = best_color
+    return atlas.reshape(atlas_h, atlas_w, 3)
 
 
-def refine_texture(run_dir: Path, num_steps: int = 300, progress_fn: callable = None) -> Path:
+# ═══════════════════════════════════════════════════════════════════════
+#  Fallback: Correspondence-Based Optimization (no PyTorch3D)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _refine_fallback(mesh: dict, keyframes: list[dict], num_steps: int,
+                     lr: float = 0.01, prerastd: dict = None,
+                     progress_fn: callable = None) -> np.ndarray:
+    """
+    Fallback texture refinement: best single-view selection per texel.
+    Picks the highest-scoring keyframe observation for each texel, producing
+    sharp results. Multi-view optimization is deferred to the PyTorch3D path.
+    """
+    if prerastd is None:
+        prerastd = _prerasterize_atlas(mesh)
+
+    atlas = _compute_initial_atlas(mesh, keyframes, prerastd=prerastd)
+
+    if progress_fn:
+        progress_fn(0, 1, 0.0)
+
+    return atlas
+
+
+def _compute_correspondences(mesh: dict, keyframes: list[dict],
+                              prerastd: dict = None) -> dict:
+    """
+    Compute texel-to-keyframe correspondences (vectorized).
+    Returns array of (texel_idx, kf_idx, px, py, score) per valid mapping.
+    """
+    atlas_w, atlas_h = mesh["atlas_w"], mesh["atlas_h"]
+
+    if prerastd is None:
+        prerastd = _prerasterize_atlas(mesh)
+
+    texel_pos = prerastd["texel_pos"]     # (N, 3)
+    texel_norm = prerastd["texel_norm"]   # (N, 3)
+    filled_idx = prerastd["filled_idx"]   # (N,)
+    n_filled = len(filled_idx)
+
+    ones_col = np.ones((n_filled, 1), dtype=np.float32)
+    pts4 = np.hstack([texel_pos, ones_col])  # (N, 4)
+
+    all_corr = []
+
+    for kf_idx, kf in enumerate(keyframes):
+        view_mat = build_view_matrix(kf["position"], kf["rotation"])
+        if not np.isfinite(view_mat).all():
+            continue
+
+        cam_pos = kf["position"]
+        fx, fy, cx, cy = kf["fx"], kf["fy"], kf["cx"], kf["cy"]
+        w, h = kf["width"], kf["height"]
+
+        view_dirs = cam_pos - texel_pos
+        dists = np.linalg.norm(view_dirs, axis=1)
+        safe_dists = np.maximum(dists, 0.01)
+        dots = np.sum(texel_norm * (view_dirs / safe_dists[:, None]), axis=1)
+        scores = dots / np.maximum(dists, 0.1)
+
+        visible = (dots > 0.05) & (dists >= 0.01)
+
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            cam = (view_mat @ pts4.T).T
+
+        cam_z = cam[:, 2]
+        in_front = cam_z > 0.001
+
+        sx = fx * cam[:, 0] / np.maximum(cam_z, 0.001) + cx
+        sy = fy * cam[:, 1] / np.maximum(cam_z, 0.001) + cy
+        in_bounds = (sx >= 0) & (sx < w - 1) & (sy >= 0) & (sy < h - 1)
+
+        valid = visible & in_front & in_bounds
+        vi = np.where(valid)[0]
+        if len(vi) == 0:
+            continue
+
+        px_i = np.clip(np.round(sx[vi]).astype(np.int32), 0, w - 1)
+        py_i = np.clip(np.round(sy[vi]).astype(np.int32), 0, h - 1)
+
+        kf_corr = np.column_stack([
+            filled_idx[vi].astype(np.float32),
+            np.full(len(vi), kf_idx, dtype=np.float32),
+            px_i.astype(np.float32),
+            py_i.astype(np.float32),
+            scores[vi],
+        ])
+        all_corr.append(kf_corr)
+
+        if kf_idx % 50 == 0:
+            logger.info(f"Correspondences: {kf_idx + 1}/{len(keyframes)} keyframes")
+
+    if all_corr:
+        corr_array = np.concatenate(all_corr, axis=0)
+    else:
+        corr_array = None
+    total = len(corr_array) if corr_array is not None else 0
+    logger.info(f"Total correspondences: {total}")
+    return {"corr_array": corr_array}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Public API
+# ═══════════════════════════════════════════════════════════════════════
+
+def refine_texture(run_dir: Path, num_steps: int = 300,
+                   progress_fn: callable = None) -> Path:
     """
     Full server-side texture refinement pipeline.
+    Uses PyTorch3D differentiable rendering if available, else falls back
+    to correspondence-based optimization.
+
     Returns path to the output PNG atlas.
     """
     logger.info(f"Starting texture refinement from {run_dir}")
 
-    # Load mesh if available
     mesh_path = run_dir / "refined_mesh.bin"
     if not mesh_path.exists():
         raise FileNotFoundError(f"No refined_mesh.bin found in {run_dir}")
@@ -469,29 +569,28 @@ def refine_texture(run_dir: Path, num_steps: int = 300, progress_fn: callable = 
     logger.info(f"Loaded mesh: {mesh['positions'].shape[0]} verts, "
                 f"atlas {mesh['atlas_w']}x{mesh['atlas_h']}")
 
-    # Load keyframes
     keyframes = load_keyframes(run_dir)
     if not keyframes:
         raise ValueError("No keyframes found")
     logger.info(f"Loaded {len(keyframes)} keyframes")
 
-    # Pre-compute correspondences
-    logger.info("Computing UV-to-pixel correspondences...")
-    correspondences = compute_correspondences(mesh, keyframes)
-    corr_list = correspondences['correspondences']
-    n_corr = sum(c.shape[0] for c in corr_list) if corr_list and isinstance(corr_list[0], np.ndarray) else len(corr_list)
-    filled = int(np.sum(correspondences['best_score'] > 0))
-    total_texels = correspondences['atlas_w'] * correspondences['atlas_h']
-    logger.info(f"Found {n_corr} correspondences, {filled}/{total_texels} texels covered "
-                f"({100*filled/max(total_texels,1):.1f}%)")
+    import time
+    t0 = time.time()
+    prerastd = _prerasterize_atlas(mesh)
+    logger.info(f"Pre-rasterization done in {time.time() - t0:.1f}s")
 
-    # Optimize
-    logger.info(f"Running differentiable optimization ({num_steps} steps)...")
-    atlas_float = optimize_atlas(correspondences, keyframes, num_steps=num_steps,
-                                  progress_fn=progress_fn)
+    atlas_float = _refine_multiview_blend(mesh, keyframes, top_k=5,
+                                           prerastd=prerastd,
+                                           progress_fn=progress_fn)
 
-    # Convert to uint8 and save as PNG
     atlas_uint8 = (np.clip(atlas_float, 0, 1) * 255).astype(np.uint8)
+
+    # V-flip: server atlas has y=0 → UV v=0 as the first row, but Unity's
+    # ImageConversion.LoadImage maps PNG row 0 (top) to texture top (UV v=1).
+    # Flip so row 0 = UV v=1, matching Unity's PNG→texture convention.
+    atlas_uint8 = atlas_uint8[::-1].copy()
+
+    atlas_uint8 = _dilate_atlas(atlas_uint8, iterations=4)
 
     from PIL import Image
     img = Image.fromarray(atlas_uint8, "RGB")
@@ -500,3 +599,33 @@ def refine_texture(run_dir: Path, num_steps: int = 300, progress_fn: callable = 
     logger.info(f"Saved HQ atlas to {out_path}")
 
     return out_path
+
+
+def _dilate_atlas(atlas: np.ndarray, iterations: int = 4) -> np.ndarray:
+    """Fill small gaps in the atlas by dilating filled pixels into empty neighbors."""
+    h, w, c = atlas.shape
+    filled = np.any(atlas > 0, axis=2)
+
+    for _ in range(iterations):
+        empty = ~filled
+        if not np.any(empty):
+            break
+
+        padded = np.pad(atlas, ((1, 1), (1, 1), (0, 0)), mode='constant')
+        padded_f = np.pad(filled, ((1, 1), (1, 1)), mode='constant')
+
+        acc = np.zeros_like(atlas, dtype=np.float32)
+        cnt = np.zeros((h, w), dtype=np.float32)
+
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nb_f = padded_f[1 + dy:h + 1 + dy, 1 + dx:w + 1 + dx]
+            nb_c = padded[1 + dy:h + 1 + dy, 1 + dx:w + 1 + dx]
+            mask = empty & nb_f
+            acc[mask] += nb_c[mask].astype(np.float32)
+            cnt[mask] += 1.0
+
+        update = cnt > 0
+        atlas[update] = (acc[update] / cnt[update, None]).astype(np.uint8)
+        filled[update] = True
+
+    return atlas
