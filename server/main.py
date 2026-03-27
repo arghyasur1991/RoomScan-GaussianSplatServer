@@ -53,6 +53,66 @@ app.add_middleware(NoCacheAPIMiddleware)
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Mesh Enhancement API
+# ═══════════════════════════════════════════════════════════════════════
+
+MESH_ENHANCE_DIR = WORK_DIR / "mesh_enhance_runs"
+MESH_ENHANCE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/enhance-mesh")
+async def enhance_mesh_endpoint(
+    request: Request,
+    smooth_iterations: int = 5,
+    smooth_method: str = "bilateral",
+    enable_plane_snap: bool = True,
+    plane_threshold: float = 0.02,
+    snap_threshold: float = 0.03,
+    max_planes: int = 10,
+):
+    """Upload refined_mesh.bin, return enhanced version with smoothing + plane snapping."""
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    import logging
+    from datetime import datetime
+    logger = logging.getLogger("mesh_enhance")
+
+    try:
+        from mesh_enhance import enhance_mesh
+
+        name = datetime.now().strftime("meshenhance_%Y%m%d_%H%M%S")
+        run_dir = MESH_ENHANCE_DIR / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = run_dir / "refined_mesh.bin"
+        input_path.write_bytes(body)
+        logger.info(f"Received mesh ({len(body)} bytes)")
+
+        output_path = enhance_mesh(
+            input_path,
+            output_path=run_dir / "enhanced_mesh.bin",
+            smooth_iterations=smooth_iterations,
+            smooth_method=smooth_method,
+            enable_plane_snap=enable_plane_snap,
+            plane_threshold=plane_threshold,
+            plane_snap_threshold=snap_threshold,
+            max_planes=max_planes,
+        )
+
+        return FileResponse(
+            path=output_path,
+            media_type="application/octet-stream",
+            filename="enhanced_mesh.bin",
+        )
+
+    except Exception as e:
+        logger.exception("Mesh enhancement failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Texture Refinement API
 # ═══════════════════════════════════════════════════════════════════════
 
