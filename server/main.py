@@ -189,6 +189,53 @@ async def refine_texture_result():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Atlas Enhancement API (super-resolution)
+# ═══════════════════════════════════════════════════════════════════════
+
+ENHANCE_DIR = WORK_DIR / "enhance_runs"
+ENHANCE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/enhance-atlas")
+async def enhance_atlas(request: Request, scale: int = 4):
+    """Upload a PNG atlas, return the super-resolved version."""
+    body = await request.body()
+    if len(body) == 0:
+        return JSONResponse(status_code=400, content={"error": "Empty body"})
+
+    import io, logging
+    from datetime import datetime
+    logger = logging.getLogger("atlas_enhance")
+
+    try:
+        from atlas_enhance import upscale_atlas
+
+        name = datetime.now().strftime("enhance_%Y%m%d_%H%M%S")
+        run_dir = ENHANCE_DIR / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = run_dir / "atlas_input.png"
+        input_path.write_bytes(body)
+        logger.info(f"Received atlas ({len(body)} bytes), saving to {run_dir}")
+
+        output_path = run_dir / "atlas_enhanced.png"
+        upscale_atlas(input_path, output_path, scale=scale)
+
+        return FileResponse(
+            path=output_path,
+            media_type="image/png",
+            filename="atlas_enhanced.png",
+        )
+
+    except ImportError as e:
+        logger.error(f"Missing dependency: {e}")
+        return JSONResponse(status_code=501, content={"error": str(e)})
+    except Exception as e:
+        logger.exception("Atlas enhancement failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Quest API (backward-compatible with GSplatServerClient.cs)
 # ═══════════════════════════════════════════════════════════════════════
 

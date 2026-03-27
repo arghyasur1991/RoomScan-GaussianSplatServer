@@ -6,3 +6,5 @@ plyfile
 msplat[cli]
 torch
 Pillow
+realesrgan
+basicsr
