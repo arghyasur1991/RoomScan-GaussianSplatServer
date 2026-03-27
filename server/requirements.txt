@@ -8,3 +8,4 @@ torch
 Pillow
 realesrgan
 basicsr
+pytorch3d
