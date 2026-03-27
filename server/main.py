@@ -299,18 +299,18 @@ ENHANCE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.post("/enhance-atlas")
-async def enhance_atlas(request: Request, scale: int = 4):
-    """Upload a PNG atlas, return the super-resolved version."""
+async def enhance_atlas_endpoint(request: Request, scale: int = 2, inpaint: bool = True):
+    """Upload a PNG atlas, return the SR-upscaled (and optionally inpainted) version."""
     body = await request.body()
     if len(body) == 0:
         return JSONResponse(status_code=400, content={"error": "Empty body"})
 
-    import io, logging
+    import logging
     from datetime import datetime
     logger = logging.getLogger("atlas_enhance")
 
     try:
-        from atlas_enhance import upscale_atlas
+        from atlas_enhance import enhance_atlas as do_enhance
 
         name = datetime.now().strftime("enhance_%Y%m%d_%H%M%S")
         run_dir = ENHANCE_DIR / name
@@ -318,10 +318,10 @@ async def enhance_atlas(request: Request, scale: int = 4):
 
         input_path = run_dir / "atlas_input.png"
         input_path.write_bytes(body)
-        logger.info(f"Received atlas ({len(body)} bytes), saving to {run_dir}")
+        logger.info(f"Received atlas ({len(body)} bytes), scale={scale}, inpaint={inpaint}")
 
         output_path = run_dir / "atlas_enhanced.png"
-        upscale_atlas(input_path, output_path, scale=scale)
+        do_enhance(input_path, output_path, scale=scale, inpaint=inpaint)
 
         return FileResponse(
             path=output_path,
