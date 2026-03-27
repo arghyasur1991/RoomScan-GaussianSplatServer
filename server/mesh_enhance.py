@@ -23,12 +23,20 @@ logger.setLevel(logging.INFO)
 #  Mesh I/O (same binary format as Unity RoomScanPersistence)
 # ═══════════════════════════════════════════════════════════════════════
 
+REFINED_MESH_MAGIC = 0x46524D52  # "RMRF" in little-endian
+
 def load_mesh(mesh_path: Path) -> dict:
-    """Load refined_mesh.bin: int vertCount, int idxCount, int atlasW, int atlasH,
+    """Load refined_mesh.bin with optional magic+version header (Unity RoomScanPersistence format).
+    Layout: [uint32 magic, int32 version,] int32 vertCount, int32 idxCount, int32 atlasW, int32 atlasH,
     then vertCount * (float3 pos + float3 norm + float2 uv) = 32 bytes/vert,
     then idxCount * int32 indices."""
     with open(mesh_path, "rb") as f:
-        vert_count = struct.unpack("<i", f.read(4))[0]
+        first4 = struct.unpack("<I", f.read(4))[0]
+        if first4 == REFINED_MESH_MAGIC:
+            _version = struct.unpack("<i", f.read(4))[0]
+            vert_count = struct.unpack("<i", f.read(4))[0]
+        else:
+            vert_count = first4
         idx_count = struct.unpack("<i", f.read(4))[0]
         atlas_w = struct.unpack("<i", f.read(4))[0]
         atlas_h = struct.unpack("<i", f.read(4))[0]
@@ -50,7 +58,7 @@ def load_mesh(mesh_path: Path) -> dict:
 
 
 def save_mesh(mesh: dict, output_path: Path):
-    """Save enhanced mesh in same binary format."""
+    """Save enhanced mesh in Unity-compatible binary format (with magic+version header)."""
     positions = mesh["positions"]
     normals = mesh["normals"]
     uvs = mesh["uvs"]
@@ -66,6 +74,8 @@ def save_mesh(mesh: dict, output_path: Path):
     ])  # (V, 8)
 
     with open(output_path, "wb") as f:
+        f.write(struct.pack("<I", REFINED_MESH_MAGIC))
+        f.write(struct.pack("<i", 1))  # version
         f.write(struct.pack("<i", vert_count))
         f.write(struct.pack("<i", idx_count))
         f.write(struct.pack("<i", mesh["atlas_w"]))
@@ -257,11 +267,13 @@ def detect_and_snap_planes(positions: np.ndarray, indices: np.ndarray,
         a, b, c, d = plane
         normal = np.array([a, b, c])
 
-        # Snap all vertices within snap_threshold (not just RANSAC inliers)
-        dists = np.abs(pos @ normal + d)
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            dists = np.abs(pos @ normal + d)
+        dists = np.nan_to_num(dists, nan=np.inf)
         snap_mask = dists < snap_threshold
         if np.sum(snap_mask) > 0:
-            pos[snap_mask] -= (np.outer(pos[snap_mask] @ normal + d, normal))
+            signed = pos[snap_mask] @ normal + d
+            pos[snap_mask] -= np.outer(signed, normal)
             snapped += np.sum(snap_mask)
 
     logger.info(f"Plane snapping: {len(planes_found)} planes, {snapped} vertices snapped")
@@ -293,7 +305,9 @@ def _ransac_plane(points: np.ndarray, threshold: float,
         normal /= norm_len
 
         d = -np.dot(normal, p0)
-        dists = np.abs(points @ normal + d)
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            dists = np.abs(points @ normal + d)
+        dists = np.nan_to_num(dists, nan=np.inf)
         inlier_mask = dists < threshold
         count = np.sum(inlier_mask)
 
