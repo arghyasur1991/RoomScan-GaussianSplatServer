@@ -641,8 +641,11 @@ def refine_texture(run_dir: Path, num_steps: int = 300,
 
     atlas_uint8 = (np.clip(atlas_float, 0, 1) * 255).astype(np.uint8)
 
-    # Simple dilation to fill 1-2 pixel gaps at UV island boundaries
-    # (faster and cleaner than inpainting for atlas textures)
+    # V-flip: server atlas has y=0 → UV v=0 as the first row, but Unity's
+    # ImageConversion.LoadImage maps PNG row 0 (top) to texture top (UV v=1).
+    # Flip so row 0 = UV v=1, matching Unity's PNG→texture convention.
+    atlas_uint8 = atlas_uint8[::-1].copy()
+
     atlas_uint8 = _dilate_atlas(atlas_uint8, iterations=4)
 
     from PIL import Image
