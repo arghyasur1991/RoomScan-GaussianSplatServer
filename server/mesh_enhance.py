@@ -1,10 +1,9 @@
 """
-Server-side mesh geometry enhancement: GCN-Denoiser smoothing + RANSAC plane snapping.
-Works on MPS (Apple Silicon), CUDA, and CPU.
+Server-side mesh geometry enhancement: bilateral normal filter + RANSAC plane snapping.
 
 Pipeline:
   1. Load mesh (refined_mesh.bin format from Unity)
-  2. GCN-Denoiser → denoised face normals → vertex position update
+  2. Bilateral normal filter → denoised face normals → vertex position update
   3. RANSAC plane detection → vertex snapping to dominant planes
   4. Export enhanced mesh in same binary format
 """

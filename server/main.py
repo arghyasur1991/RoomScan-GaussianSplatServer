@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import threading
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -75,8 +78,6 @@ async def enhance_mesh_endpoint(
     if len(body) == 0:
         return JSONResponse(status_code=400, content={"error": "Empty body"})
 
-    import logging
-    from datetime import datetime
     logger = logging.getLogger("mesh_enhance")
 
     try:
@@ -127,8 +128,6 @@ async def inpaint_atlas_endpoint(request: Request, method: str = "auto"):
     if len(body) == 0:
         return JSONResponse(status_code=400, content={"error": "Empty body"})
 
-    import logging
-    from datetime import datetime
     logger = logging.getLogger("atlas_inpaint")
 
     try:
@@ -158,8 +157,6 @@ async def inpaint_atlas_endpoint(request: Request, method: str = "auto"):
 #  Texture Refinement API
 # ═══════════════════════════════════════════════════════════════════════
 
-import threading
-
 REFINE_DIR = WORK_DIR / "refine_runs"
 REFINE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_REFINE_RUNS = 10
@@ -176,7 +173,6 @@ _refine_thread: threading.Thread | None = None
 
 
 def _run_refine_thread(run_dir: Path, num_steps: int):
-    import logging
     from texture_refine import refine_texture as do_refine
     logger = logging.getLogger("texture_refine")
 
@@ -219,8 +215,7 @@ async def refine_texture_start(request: Request, steps: int | None = None):
     if len(body) == 0:
         return JSONResponse(status_code=400, content={"error": "Empty body"})
 
-    import zipfile, io, shutil, logging
-    from datetime import datetime
+    import zipfile, io, shutil
     logger = logging.getLogger("texture_refine")
 
     try:
@@ -305,8 +300,6 @@ async def enhance_atlas_endpoint(request: Request, scale: int = 2, inpaint: bool
     if len(body) == 0:
         return JSONResponse(status_code=400, content={"error": "Empty body"})
 
-    import logging
-    from datetime import datetime
     logger = logging.getLogger("atlas_enhance")
 
     try:
@@ -507,7 +500,6 @@ async def api_render_image(filename: str):
         return JSONResponse(status_code=404, content={"error": "Render not found"})
     media = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
     return FileResponse(path=path, media_type=media)
-
 
 
 @app.api_route("/api/splat", methods=["GET", "HEAD"])
