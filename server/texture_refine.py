@@ -110,7 +110,10 @@ def load_keyframes(run_dir: Path) -> list[dict]:
             continue
 
         img = Image.open(img_path).convert("RGB")
-        pixels = np.array(img, dtype=np.float32) / 255.0
+        # Flip vertically: Unity's GetPixels32() has row 0 at the bottom,
+        # but PIL has row 0 at the top. The projection formula assumes
+        # Unity's bottom-up convention, so flip to match.
+        pixels = np.array(img, dtype=np.float32)[::-1].copy() / 255.0
 
         sw = meta.get("sw", img.width)
         sh = meta.get("sh", img.height)
